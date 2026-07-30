@@ -1,0 +1,1195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Parallax Mapping vs. Real Displacement — Offset Limiting, POM &amp; Silhouettes</title>
+<style>
+  :root{
+    --bg:#0b0d12; --panel:#12151d; --panel2:#171b26; --line:#242938;
+    --ink:#e6e9f2; --dim:#8b93a7; --acc:#ff8a4c; --acc2:#4cc4ff;
+    --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{
+    background:var(--bg); color:var(--ink); overflow:hidden;
+    font:13px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif;
+    display:flex;
+  }
+  #stage{position:relative;flex:1;min-width:0}
+  canvas{display:block;width:100%;height:100%;cursor:grab}
+  canvas.drag{cursor:grabbing}
+
+  .lab{
+    position:absolute;top:14px;padding:5px 10px;border-radius:4px;
+    background:rgba(8,10,15,.72);backdrop-filter:blur(6px);
+    border:1px solid var(--line);font:600 11px/1 var(--mono);
+    letter-spacing:.06em;text-transform:uppercase;pointer-events:none;
+    white-space:nowrap;
+  }
+  #labA{left:14px;border-left:2px solid var(--acc)}
+  #labB{right:14px;border-left:2px solid var(--acc2);display:none}
+  #hud{
+    position:absolute;left:14px;bottom:12px;font:11px/1.6 var(--mono);
+    color:var(--dim);pointer-events:none;text-shadow:0 1px 3px #000;
+  }
+  #hud b{color:var(--ink);font-weight:600}
+  #warn{
+    position:absolute;left:14px;bottom:38px;font:11px/1.5 var(--mono);
+    color:#ffbe7a;pointer-events:none;text-shadow:0 1px 3px #000;max-width:46ch;display:none;
+  }
+
+  #handle{
+    position:absolute;top:0;bottom:0;width:22px;margin-left:-11px;
+    cursor:ew-resize;display:none;z-index:5;
+  }
+  #handle::after{
+    content:"";position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);
+    width:5px;height:34px;border-radius:3px;background:#fff;opacity:.85;
+    box-shadow:0 0 0 1px rgba(0,0,0,.5);
+  }
+
+  #panel{
+    width:290px;flex:none;background:var(--panel);border-left:1px solid var(--line);
+    overflow-y:auto;padding:16px 16px 28px;
+  }
+  #panel h1{font-size:14px;letter-spacing:-.01em;margin-bottom:2px}
+  #panel h1 span{color:var(--acc)}
+  .sub{color:var(--dim);font-size:11px;margin-bottom:16px}
+  .grp{margin-bottom:16px;padding-bottom:14px;border-bottom:1px solid var(--line)}
+  .grp:last-child{border:0}
+  .ttl{
+    font:600 10px/1 var(--mono);letter-spacing:.11em;text-transform:uppercase;
+    color:var(--dim);margin-bottom:9px;
+  }
+  select{
+    width:100%;background:var(--panel2);color:var(--ink);border:1px solid var(--line);
+    border-radius:5px;padding:7px 8px;font:12px var(--mono);cursor:pointer;
+  }
+  select:focus{outline:none;border-color:var(--acc)}
+  .sel-b{margin-top:7px}
+  .sel-b select:focus{border-color:var(--acc2)}
+
+  .row{display:flex;justify-content:space-between;align-items:baseline;margin:11px 0 3px}
+  .row label{font-size:12px}
+  .row output{font:11px var(--mono);color:var(--acc)}
+  .row.off label,.row.off output{opacity:.4}
+  input[type=range]{
+    width:100%;-webkit-appearance:none;appearance:none;height:3px;border-radius:2px;
+    background:var(--line);outline:none;
+  }
+  input[type=range]:disabled{opacity:.4}
+  input[type=range]::-webkit-slider-thumb{
+    -webkit-appearance:none;width:13px;height:13px;border-radius:50%;
+    background:var(--ink);cursor:pointer;border:0;
+  }
+  input[type=range]::-moz-range-thumb{
+    width:13px;height:13px;border-radius:50%;background:var(--ink);cursor:pointer;border:0;
+  }
+  .chk{display:flex;align-items:center;gap:8px;padding:5px 0;cursor:pointer;font-size:12px}
+  .chk input{accent-color:var(--acc);width:14px;height:14px;cursor:pointer}
+  .seg{display:grid;gap:4px}
+  .seg.c2{grid-template-columns:repeat(2,1fr)}
+  .seg.c3{grid-template-columns:repeat(3,1fr)}
+  .seg.c4{grid-template-columns:repeat(4,1fr)}
+  .seg button{
+    background:var(--panel2);color:var(--dim);border:1px solid var(--line);
+    border-radius:5px;padding:7px 0;font:11px var(--mono);cursor:pointer;
+  }
+  .seg button:hover{color:var(--ink)}
+  .seg button.on{background:var(--acc);border-color:var(--acc);color:#1a0d05;font-weight:700}
+  .btns{display:grid;gap:5px}
+  .btns button{
+    background:var(--panel2);color:var(--ink);border:1px solid var(--line);
+    border-radius:5px;padding:7px 9px;font:11px var(--mono);text-align:left;cursor:pointer;
+  }
+  .btns button:hover{border-color:var(--acc);color:var(--acc)}
+  .note{color:var(--dim);font-size:11px;line-height:1.5}
+  .note code{font:10px var(--mono);color:var(--acc);background:var(--panel2);padding:1px 4px;border-radius:3px}
+  .note+.note{margin-top:7px}
+  @media(max-width:820px){
+    body{flex-direction:column}
+    #panel{width:100%;height:46%;border-left:0;border-top:1px solid var(--line)}
+    #stage{height:54%}
+  }
+</style>
+</head>
+<body>
+
+<div id="stage">
+  <canvas id="gl"></canvas>
+  <div class="lab" id="labA">A</div>
+  <div class="lab" id="labB">B</div>
+  <div id="handle"></div>
+  <div id="warn"></div>
+  <div id="hud"></div>
+</div>
+
+<aside id="panel">
+  <h1>Parallax <span>&rarr;</span> POM <span>&rarr;</span> Silhouettes</h1>
+  <div class="sub">What a game's model-quality slider is actually switching</div>
+
+  <div class="grp">
+    <div class="ttl">Geometry</div>
+    <div class="seg c2" id="geom">
+      <button data-g="1">Tower</button>
+      <button data-g="0">Wall</button>
+    </div>
+    <p class="note" style="margin-top:8px">
+      Only curved geometry gets a true silhouette. On a wall the relief can bite
+      <em>inward</em> from the polygon border, but nothing can push past it —
+      the rasterizer emits no fragments out there to shade.
+    </p>
+  </div>
+
+  <div class="grp">
+    <div class="ttl">Material</div>
+    <div class="seg c3" id="mats">
+      <button data-m="scan">Scan 2K</button>
+      <button data-m="rock">Fieldstone</button>
+      <button data-m="brick">Brick</button>
+    </div>
+    <p class="note" style="margin-top:8px" id="matNote"></p>
+  </div>
+
+  <div class="grp">
+    <div class="ttl">Technique</div>
+    <select id="modeA"></select>
+    <div class="sel-b" id="wrapB"><select id="modeB"></select></div>
+    <label class="chk"><input type="checkbox" id="compare"> Split-screen compare</label>
+  </div>
+
+  <div class="grp">
+    <div class="ttl">Surface</div>
+    <div class="row"><label>Depth</label><output id="oDepth"></output></div>
+    <input type="range" id="depth" min="0" max="0.30" step="0.005">
+    <div class="row" id="rowSteps"><label>Number of steps</label><output id="oSteps"></output></div>
+    <input type="range" id="steps" min="2" max="32" step="1">
+    <div class="row" id="rowIndep"><label>Step view independence</label><output id="oIndep"></output></div>
+    <input type="range" id="indep" min="0" max="1" step="0.05">
+    <div class="row"><label>Tiling</label><output id="oTile"></output></div>
+    <input type="range" id="tile" min="1" max="3" step="1">
+  </div>
+
+  <div class="grp">
+    <div class="ttl">Options</div>
+    <label class="chk"><input type="checkbox" id="shadow"> Self-shadowing</label>
+    <label class="chk"><input type="checkbox" id="heat"> Step-cost heatmap</label>
+    <label class="chk"><input type="checkbox" id="sweep"> Auto-rotate</label>
+  </div>
+
+  <div class="grp">
+    <div class="ttl">Light</div>
+    <div class="row"><label>Azimuth</label><output id="oLa"></output></div>
+    <input type="range" id="la" min="-3.14" max="3.14" step="0.01">
+    <div class="row"><label>Elevation</label><output id="oLe"></output></div>
+    <input type="range" id="le" min="0.03" max="1.45" step="0.01">
+  </div>
+
+  <div class="grp">
+    <div class="ttl">Quality profile &rarr; A</div>
+    <div class="seg c4" id="profiles">
+      <button data-p="Low">Low</button>
+      <button data-p="Med">Med</button>
+      <button data-p="High">High</button>
+      <button data-p="Ultra">Ultra</button>
+    </div>
+    <p class="note" style="margin-top:8px">
+      Roughly the ladder a <code>Model Quality</code> setting walks. Crimson Desert,
+      for one, drops tessellation at Low and substitutes parallax &mdash; so the
+      cheap tiers here are what a game falls back <em>to</em>, not what it starts from.
+    </p>
+  </div>
+
+  <div class="grp">
+    <div class="ttl">Compare presets</div>
+    <p class="note" style="margin:-2px 0 8px">
+      Shortcuts only &mdash; each just sets the two <em>Technique</em> dropdowns above,
+      which take any of the six modes in either slot.
+    </p>
+    <div class="btns">
+      <button data-a="1" data-b="2">Naive vs. offset-limited</button>
+      <button data-a="2" data-b="4">Offset-limited vs. POM</button>
+      <button data-a="3" data-b="4">Steep vs. POM (banding)</button>
+      <button data-a="4" data-b="5" data-g="1">POM vs. silhouette POM</button>
+      <button data-a="0" data-b="5" data-g="1">Flat vs. silhouette POM</button>
+    </div>
+  </div>
+
+  <div class="grp">
+    <div class="ttl">Why the outline breaks</div>
+    <p class="note">
+      Tangent-space POM marches a <em>flat</em> height field, so it can never move the
+      polygon's edge — the tower stays a clean circle.
+    </p>
+    <p class="note">
+      SilPOM marches the real ray against the real cylinder in object space. Rays
+      grazing the limb pass through the joints between stones, exit without
+      hitting anything, and <code>discard</code> — carving the outline ragged.
+    </p>
+    <p class="note">
+      CryEngine ships this as <em>Silhouette POM</em> and describes it as "a mix
+      between POM and tessellation… affects the silhouette as it would with a
+      tessellated object, without actually being tessellated."
+    </p>
+    <p class="note">
+      It is <em>not</em> equivalent to tessellation, though. Real displacement makes
+      geometry: it shadows correctly, writes correct depth, and survives every pass.
+      This fakes the outline with <code>discard</code> and never writes
+      <code>gl_FragDepth</code>, so the depth buffer keeps the <em>undisplaced
+      hull's</em> depth — silently wrong rather than merely absent.
+      Most engines take the geometry path &mdash; see the cost notes in the README.
+    </p>
+  </div>
+</aside>
+
+<script src="texture-data.js"></script>
+<script>
+"use strict";
+
+/* ============================================================
+   Procedural brick material: height, albedo, normal — tileable
+   ============================================================ */
+const TEX = 512;
+
+// Integer-lattice hash. The usual fract(sin(dot(...))) trick costs ~13M Math.sin
+// calls to bake one 512² material — nearly two seconds of dead UI. All callers
+// pass values that stay distinct after truncation.
+function hash2(x, y) {
+  let n = Math.imul(x | 0, 374761393) + Math.imul(y | 0, 668265263);
+  n = Math.imul(n ^ (n >>> 13), 1274126177);
+  return ((n ^ (n >>> 16)) >>> 0) / 4294967296;
+}
+// value noise on a lattice that wraps every (px,py), so the result tiles
+function pnoise(x, y, px, py) {
+  const xi = Math.floor(x), yi = Math.floor(y);
+  const xf = x - xi, yf = y - yi;
+  const u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
+  const m = (a, p) => ((a % p) + p) % p;
+  const a = hash2(m(xi, px),     m(yi, py));
+  const b = hash2(m(xi + 1, px), m(yi, py));
+  const c = hash2(m(xi, px),     m(yi + 1, py));
+  const d = hash2(m(xi + 1, px), m(yi + 1, py));
+  return a * (1 - u) * (1 - v) + b * u * (1 - v) + c * (1 - u) * v + d * u * v;
+}
+function pfbm(u, v, base, oct) {
+  let s = 0, amp = 0.5, f = 1, norm = 0;
+  for (let i = 0; i < oct; i++) {
+    s += amp * pnoise(u * base * f, v * base * f, base * f, base * f);
+    norm += amp; f *= 2; amp *= 0.5;
+  }
+  return s / norm;
+}
+
+/* ---- regular running-bond brick ---------------------------------------- */
+const ROWS = 5, COLS = 3, MORTAR = 0.010;
+
+function brickAt(u, v) {
+  const r  = Math.floor(v * ROWS);
+  const u2 = u + (r & 1) * 0.5;
+  const c  = Math.floor(u2 * COLS);
+  const fx = u2 * COLS - Math.floor(u2 * COLS);
+  const fy = v  * ROWS - r;
+  const du = Math.min(fx, 1 - fx) / (MORTAR * COLS);
+  const dv = Math.min(fy, 1 - fy) / (MORTAR * ROWS);
+  return { r, c: ((c % COLS) + COLS) % COLS, e: Math.min(du, dv) };
+}
+
+function sampleBrick(u, v) {
+  const b = brickAt(u, v);
+  const bevel = Math.min(1, Math.max(0, b.e));
+  const sm = bevel * bevel * (3 - 2 * bevel);
+
+  const grain  = pfbm(u, v, 96, 3);
+  const grunge = pfbm(u, v, 12, 5);
+  const jitter = (hash2(b.c * 7.3 + 2.1, b.r * 3.7 + 5.9) - 0.5) * 0.14;
+  const chip   = Math.max(0, 0.32 - pfbm(u, v, 22, 4)) * 0.8;
+
+  // deep mortar: the valleys are what carve the silhouette, so keep them low
+  const mortarH = 0.02 + 0.06 * grunge;
+  const h = Math.min(1, Math.max(0,
+    mortarH + ((0.86 + jitter + 0.06 * grain - chip) - mortarH) * sm));
+
+  const pal = [[0.55,0.26,0.19], [0.47,0.22,0.17], [0.60,0.32,0.22], [0.41,0.21,0.20]];
+  const p = pal[Math.floor(hash2(b.c * 11.1, b.r * 17.7) * 4) % 4];
+  const tint = 0.80 + 0.40 * grunge;
+  const mc = 0.50 + 0.16 * grunge;
+  const face = Math.min(1, Math.max(0, (b.e - 0.25) / 0.5));
+  const dark = 0.66 + 0.34 * h;
+  return [h,
+    (mc        + (p[0] * tint - mc)        * face) * dark,
+    (mc * 0.97 + (p[1] * tint - mc * 0.97) * face) * dark,
+    (mc * 0.92 + (p[2] * tint - mc * 0.92) * face) * dark];
+}
+
+/* ---- irregular fieldstone ----------------------------------------------
+   An additively-weighted Voronoi: each cell carries a random weight that is
+   subtracted from its distance, so heavily-weighted seeds annex territory from
+   their neighbours. One grid therefore yields stones of genuinely different
+   sizes, which running-bond brick can never do. Seeds are precomputed and the
+   lattice wraps, so the result still tiles.                                  */
+const RCELLS = 5;
+const RSEED = (() => {
+  const t = new Float32Array(RCELLS * RCELLS * 3);
+  for (let y = 0; y < RCELLS; y++) {
+    for (let x = 0; x < RCELLS; x++) {
+      const k = (y * RCELLS + x) * 3;
+      t[k    ] = 0.12 + 0.76 * hash2(x * 13.7 + 1.3, y *  7.1 + 9.7);
+      t[k + 1] = 0.12 + 0.76 * hash2(x * 29.3 + 4.7, y * 17.9 + 2.1);
+      t[k + 2] = 0.34 * hash2(x * 41.1 + 6.9, y * 23.3 + 8.3);   // weight
+    }
+  }
+  return t;
+})();
+
+function voronoi(px, py) {
+  const ix0 = Math.floor(px), iy0 = Math.floor(py);
+  let b1 = 1e9, b2 = 1e9, id = 0, ox = 0, oy = 0;
+  // 5x5 neighbourhood: a strongly weighted seed two cells away can still win
+  for (let dy = -2; dy <= 2; dy++) {
+    for (let dx = -2; dx <= 2; dx++) {
+      const ix = ix0 + dx, iy = iy0 + dy;
+      const wx = ((ix % RCELLS) + RCELLS) % RCELLS;
+      const wy = ((iy % RCELLS) + RCELLS) % RCELLS;
+      const k = (wy * RCELLS + wx) * 3;
+      const ex = px - (ix + RSEED[k]), ey = py - (iy + RSEED[k + 1]);
+      const d = Math.sqrt(ex * ex + ey * ey) - RSEED[k + 2];
+      if (d < b1) { b2 = b1; b1 = d; id = wy * RCELLS + wx; ox = ex; oy = ey; }
+      else if (d < b2) b2 = d;
+    }
+  }
+  // ox,oy = offset from the winning seed, used to tilt the stone's face
+  return { edge: b2 - b1, id, ox, oy };
+}
+
+function sampleRock(u, v) {
+  // Warp the lookup so joints wander instead of running dead straight. Amplitude
+  // is in CELL units — push it near 1 and the stones dissolve into cracked mud.
+  const w = 0.22;
+  const c = voronoi(u * RCELLS + w * (pfbm(u, v, 4, 3) - 0.5) * 2,
+                    v * RCELLS + w * (pfbm(u + 3.1, v + 1.7, 4, 3) - 0.5) * 2);
+
+  /* Profile shape. Driving the bevel straight off the symmetric edge distance
+     gives every joint an identical V-groove bottoming at a shared floor, which
+     buries the per-stone height variation. Instead: each stone is inset by its
+     own amount (so joint widths differ), the chamfer is narrow (so the flanks
+     are near-vertical steps rather than slopes), and the face is tilted, so two
+     neighbouring stones meet at two clearly different heights. */
+  const inset = 0.05 + 0.075 * hash2(c.id * 19.3 + 3.1, c.id * 6.1 + 8.7);
+  const CHAMFER = 0.035;
+  const t  = Math.min(1, Math.max(0, (c.edge - inset) / CHAMFER));
+  const sm = t * t * (3 - 2 * t);
+
+  const grain  = pfbm(u, v, 130, 3);
+  const grunge = pfbm(u, v, 9, 5);
+  const pit    = Math.max(0, 0.30 - pfbm(u, v, 38, 4)) * 0.6;
+  const cellH  = hash2(c.id * 3.3 + 0.7, c.id * 7.7 + 2.9);
+
+  // per-stone face tilt, so plateaus are not all parallel to the base plane
+  const tx = (hash2(c.id * 27.7 + 1.9, c.id * 9.9 + 4.3) - 0.5) * 0.22;
+  const ty = (hash2(c.id * 15.1 + 7.7, c.id * 31.3 + 2.3) - 0.5) * 0.22;
+  const tilt = tx * c.ox + ty * c.oy;
+
+  const mortarH = 0.02 + 0.06 * grunge;
+  const stoneH  = 0.58 + 0.34 * cellH + tilt + 0.06 * grain - pit;
+  const h = Math.min(1, Math.max(0, mortarH + (stoneH - mortarH) * sm));
+
+  const pal = [[0.58,0.52,0.44], [0.46,0.41,0.36], [0.64,0.57,0.46],
+               [0.39,0.36,0.33], [0.55,0.45,0.35], [0.50,0.48,0.43]];
+  const p = pal[Math.floor(hash2(c.id * 11.1 + 5.5, c.id * 5.3 + 1.1) * 6) % 6];
+  const tint = 0.76 + 0.46 * grunge;
+  const mc = 0.28 + 0.13 * grunge;
+  // colour band follows the joint itself, not the (now very narrow) chamfer
+  const face = Math.min(1, Math.max(0, (c.edge - 0.02) / 0.10));
+  const dark = 0.60 + 0.40 * h;
+  return [h,
+    (mc        + (p[0] * tint - mc)        * face) * dark,
+    (mc * 0.99 + (p[1] * tint - mc * 0.99) * face) * dark,
+    (mc * 0.94 + (p[2] * tint - mc * 0.94) * face) * dark];
+}
+
+function uploadTex(gl, data, S) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, S, S, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
+  gl.generateMipmap(gl.TEXTURE_2D);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  const an = gl.getExtension("EXT_texture_filter_anisotropic");
+  if (an) gl.texParameterf(gl.TEXTURE_2D, an.TEXTURE_MAX_ANISOTROPY_EXT,
+                           Math.min(8, gl.getParameter(an.MAX_TEXTURE_MAX_ANISOTROPY_EXT)));
+  return t;
+}
+
+/* Derives the normal map from the height field and uploads both. Scaling the
+   gradient by S keeps the slope in UV units, so a 2K scan and a 512 procedural
+   map end up with the same apparent bump strength. */
+function packTextures(gl, H, alb, S) {
+  const nrm = new Uint8Array(S * S * 4);
+  const BUMP = 0.10 * S * 0.5;
+  for (let y = 0; y < S; y++) {
+    for (let x = 0; x < S; x++) {
+      const l = H[y * S + ((x - 1 + S) % S)], r = H[y * S + ((x + 1) % S)];
+      const d = H[((y - 1 + S) % S) * S + x], t = H[((y + 1) % S) * S + x];
+      let nx = -(r - l) * BUMP, ny = -(t - d) * BUMP;
+      const len = Math.hypot(nx, ny, 1.0);
+      const i4 = (y * S + x) * 4;
+      nrm[i4    ] = ((nx / len * 0.5 + 0.5) * 255) | 0;
+      nrm[i4 + 1] = ((ny / len * 0.5 + 0.5) * 255) | 0;
+      nrm[i4 + 2] = ((1.0 / len * 0.5 + 0.5) * 255) | 0;
+      nrm[i4 + 3] = 255;
+    }
+  }
+  return { albedo: uploadTex(gl, alb, S), normal: uploadTex(gl, nrm, S) };
+}
+
+function buildMaterial(gl, sample) {
+  const S = TEX;
+  const H   = new Float32Array(S * S);
+  const alb = new Uint8Array(S * S * 4);
+  for (let y = 0; y < S; y++) {
+    const v = (y + 0.5) / S;
+    for (let x = 0; x < S; x++) {
+      const s = sample((x + 0.5) / S, v);
+      const i = y * S + x, i4 = i * 4;
+      H[i] = s[0];
+      alb[i4    ] = Math.min(255, Math.max(0, s[1] * 255)) | 0;
+      alb[i4 + 1] = Math.min(255, Math.max(0, s[2] * 255)) | 0;
+      alb[i4 + 2] = Math.min(255, Math.max(0, s[3] * 255)) | 0;
+      alb[i4 + 3] = (s[0] * 255) | 0;
+    }
+  }
+  return packTextures(gl, H, alb, S);
+}
+
+/* ---- scanned photogrammetry material ------------------------------------
+   Decodes the embedded diffuse + displacement, repacks them into the same
+   layout the shader expects (RGB = albedo, A = height) and derives normals
+   from the height so relief and shading agree exactly.                      */
+const scanMat = { albedo: null, normal: null, ready: false, failed: false };
+
+function loadScan(onDone) {
+  const src = window.ROCKWALL;
+  if (!src) { scanMat.failed = true; onDone(); return; }
+  const imgs = {};
+  let left = 2;
+  const fail = () => { scanMat.failed = true; onDone(); };
+  const step = () => {
+    if (--left) return;
+    const S = imgs.albedo.naturalWidth;
+    const cv = document.createElement("canvas");
+    cv.width = cv.height = S;
+    const ctx = cv.getContext("2d", { willReadFrequently: true });
+
+    ctx.drawImage(imgs.albedo, 0, 0, S, S);
+    const alb = ctx.getImageData(0, 0, S, S).data;
+    ctx.drawImage(imgs.height, 0, 0, S, S);
+    const hgt = ctx.getImageData(0, 0, S, S).data;
+
+    const H = new Float32Array(S * S);
+    for (let i = 0; i < S * S; i++) {
+      const h = hgt[i * 4];              // greyscale: any channel will do
+      H[i] = h / 255;
+      alb[i * 4 + 3] = h;                // height rides in alpha
+    }
+    const t = packTextures(gl, H, alb, S);
+    scanMat.albedo = t.albedo; scanMat.normal = t.normal; scanMat.ready = true;
+    onDone();
+  };
+  for (const k of ["albedo", "height"]) {
+    const im = new Image();
+    im.onload = () => { imgs[k] = im; step(); };
+    im.onerror = fail;
+    im.src = src[k];
+  }
+}
+
+/* ============================================================
+   Math
+   ============================================================ */
+function perspective(fovy, asp, n, f) {
+  const t = 1 / Math.tan(fovy / 2);
+  return new Float32Array([t / asp,0,0,0, 0,t,0,0, 0,0,(f + n) / (n - f),-1, 0,0,2 * f * n / (n - f),0]);
+}
+function lookAt(e, c, up) {
+  let zx = e[0] - c[0], zy = e[1] - c[1], zz = e[2] - c[2];
+  let l = Math.hypot(zx, zy, zz); zx /= l; zy /= l; zz /= l;
+  let xx = up[1] * zz - up[2] * zy, xy = up[2] * zx - up[0] * zz, xz = up[0] * zy - up[1] * zx;
+  l = Math.hypot(xx, xy, xz) || 1; xx /= l; xy /= l; xz /= l;
+  const yx = zy * xz - zz * xy, yy = zz * xx - zx * xz, yz = zx * xy - zy * xx;
+  return new Float32Array([
+    xx, yx, zx, 0,  xy, yy, zy, 0,  xz, yz, zz, 0,
+    -(xx * e[0] + xy * e[1] + xz * e[2]),
+    -(yx * e[0] + yy * e[1] + yz * e[2]),
+    -(zx * e[0] + zy * e[1] + zz * e[2]), 1,
+  ]);
+}
+
+/* ============================================================
+   Geometry
+     Both surfaces are modelled at the TOP of the height field, the standard
+     relief-mapping convention: displacement only ever recedes inward, so the
+     rasterized hull is a correct outer bound for the ray march.
+     Wall  : plane z = 0, x,y in [-1,1]
+     Tower : cylinder r = 1, y in [-TY, TY]
+   ============================================================ */
+// tall enough that the open rims sit outside the default framing
+const TOWER_R = 1.0, TOWER_Y = 2.0;
+
+function wallMesh() {
+  return new Float32Array([
+    -1,-1,0,  1,-1,0,  1,1,0,
+    -1,-1,0,  1, 1,0, -1,1,0,
+  ]);
+}
+function towerMesh(seg) {
+  const v = [];
+  for (let i = 0; i < seg; i++) {
+    const a0 = (i / seg) * Math.PI * 2, a1 = ((i + 1) / seg) * Math.PI * 2;
+    const x0 = Math.cos(a0) * TOWER_R, z0 = Math.sin(a0) * TOWER_R;
+    const x1 = Math.cos(a1) * TOWER_R, z1 = Math.sin(a1) * TOWER_R;
+    // CCW seen from outside, so BACK-face culling keeps the near half.
+    // Get this backwards and the far half is rasterized instead: the limb
+    // silhouette still looks right, but the end rims come out inside-out.
+    v.push(x0,-TOWER_Y,z0,  x1, TOWER_Y,z1,  x1,-TOWER_Y,z1);
+    v.push(x0,-TOWER_Y,z0,  x0, TOWER_Y,z0,  x1, TOWER_Y,z1);
+  }
+  return new Float32Array(v);
+}
+
+/* ============================================================
+   Shaders
+   ============================================================ */
+const VS = `#version 300 es
+layout(location=0) in vec3 aPos;
+uniform mat4 uProj, uView;
+out vec3 vWorld;
+void main(){ vWorld = aPos; gl_Position = uProj * uView * vec4(aPos, 1.0); }`;
+
+const FS = `#version 300 es
+precision highp float;
+in vec3 vWorld;
+uniform sampler2D uAlb, uNrm;
+uniform vec3  uCam, uLight;
+uniform float uH, uSplit, uTile, uIndep;
+uniform int   uSteps, uModeA, uModeB, uGeom;
+uniform bool  uCompare, uShadow, uHeat;
+out vec4 frag;
+
+const float TAU = 6.28318530718;
+const float R   = ${TOWER_R.toFixed(4)};
+const float TY  = ${TOWER_Y.toFixed(4)};
+
+/* ---- surface parameterisation -------------------------------------------
+   uvOf(P)   : texture coords (already multiplied by tile count) at a point
+   wpu       : world units spanned by ONE texture repeat, per tangent axis.
+               Needed to convert a world-space depth into a UV offset.       */
+// tower ratio 3:2 keeps texels square-ish: circumference 2*PI*R vs height 2*TY
+vec2 tiles(){ return uGeom == 0 ? vec2(uTile) : vec2(3.0 * uTile, 2.0 * uTile); }
+vec2 wpu(){
+  vec2 t = tiles();
+  return uGeom == 0 ? vec2(2.0) / t : vec2(TAU * R, 2.0 * TY) / t;
+}
+vec2 uvOf(vec3 P){
+  vec2 t = tiles();
+  if (uGeom == 0) return (P.xy * 0.5 + 0.5) * t;
+  return vec2(atan(P.z, P.x) / TAU + 0.5, (P.y + TY) / (2.0 * TY)) * t;
+}
+float heightAt(vec2 uv){ return textureLod(uAlb, uv, 0.0).a; }
+
+/* Signed INSIDE/OUTSIDE test, >0 outside the material. Deliberately not a true
+   signed-distance field: it measures along one axis only (z for the wall, radius
+   for the tower), so its magnitude overstates the real distance on steep slopes.
+   That is fine here because the caller only reads its sign and then interpolates
+   between the last two samples — but do not feed it to a distance-based marcher
+   expecting a conservative step bound, because it is not one. */
+float fieldAt(vec3 P){
+  if (uGeom == 0) return P.z + (1.0 - heightAt(uvOf(P))) * uH;
+  return length(P.xz) - (R - (1.0 - heightAt(uvOf(P))) * uH);
+}
+
+vec3 heat(float t){
+  t = clamp(t, 0.0, 1.0);
+  return clamp(vec3(1.5 - abs(4.0*t - 3.0), 1.5 - abs(4.0*t - 2.0), 1.5 - abs(4.0*t - 1.0)), 0.0, 1.0);
+}
+
+/* ---- ray vs. the undisplaced hull ---------------------------------------
+   t1 is clipped to the FAR side of the displaceable shell, never the far side
+   of the whole solid. Material can only live between the outer surface and a
+   floor uH beneath it; at that floor the field is provably <= 0, so a ray that
+   gets there is already inside, and the solid flag reports it as a hit. Keeping
+   this span tight is what lets the step slider actually control the step size
+   -- with the full chord the safety floor in marchObject swamps it. */
+bool hitHull(vec3 O, vec3 D, out float t0, out float t1, out bool solid){
+  solid = false;
+  if (uGeom == 0){
+    if (abs(D.z) < 1e-5) return false;
+    t0 = -O.z / D.z;
+    if (t0 <= 0.0) return false;
+    vec3 P = O + D * t0;
+    if (abs(P.x) > 1.0 || abs(P.y) > 1.0) return false;
+    t1 = (-uH - O.z) / D.z;                  // the slab floor
+    if (t1 <= t0) { t1 = t0; return true; }
+    solid = true;
+    return true;
+  }
+  float a = dot(D.xz, D.xz);
+  float b = 2.0 * dot(O.xz, D.xz);
+  float c = dot(O.xz, O.xz) - R * R;
+  float disc = b * b - 4.0 * a * c;
+  if (disc <= 0.0) return false;
+  float s = sqrt(disc);
+  t0 = (-b - s) / (2.0 * a);
+  t1 = (-b + s) / (2.0 * a);
+  if (t1 <= 0.0) return false;
+  t0 = max(t0, 0.0);
+  // clip against the end caps
+  if (abs(D.y) > 1e-6){
+    float ta = ( TY - O.y) / D.y, tb = (-TY - O.y) / D.y;
+    t0 = max(t0, min(ta, tb));
+    t1 = min(t1, max(ta, tb));
+  } else if (abs(O.y) > TY) return false;
+
+  // near hit on the inner cylinder: past it the ray is inside the material
+  float Ri = R - uH;
+  float ci = dot(O.xz, O.xz) - Ri * Ri;
+  float di = b * b - 4.0 * a * ci;
+  if (di > 0.0){
+    float tin = (-b - sqrt(di)) / (2.0 * a);
+    if (tin > t0 && tin < t1){ t1 = tin; solid = true; }
+  }
+  return t1 > t0;
+}
+
+/* ---- A: tangent-space marching (flat height field, no silhouette) -------- */
+/* CryEngine's "step size view independence": at 0 the sample count is constant,
+   at 1 it falls off with how head-on the surface is, so grazing rays — the ones
+   that actually travel far through the height field — keep the full budget. */
+/* The lower clamp has to sit below the slider's minimum or it silently becomes
+   the real step count and the bottom of the range does nothing. */
+float stepsFor(float cosA){ return max(2.0, float(uSteps) * (1.0 - uIndep * abs(cosA))); }
+
+vec2 marchTangent(vec2 uv0, vec3 V, vec2 sc, bool interp, out float iters){
+  float n = stepsFor(V.z);
+  float dLayer = 1.0 / n;
+  vec2  dUV = ((V.xy / max(V.z, 0.02)) * sc) / n;
+
+  float layer = 0.0, i = 0.0;
+  vec2  cur = uv0;
+  float d = 1.0 - heightAt(cur);
+  for (int k = 0; k < 512; k++){
+    if (layer >= d || i >= n) break;
+    cur -= dUV; layer += dLayer; d = 1.0 - heightAt(cur); i += 1.0;
+  }
+  iters = i / n;
+  if (interp){
+    vec2 prev = cur + dUV;
+    float after = d - layer;
+    float befor = (1.0 - heightAt(prev)) - layer + dLayer;
+    cur = mix(cur, prev, clamp(after / (after - befor + 1e-6), 0.0, 1.0));
+  }
+  return cur;
+}
+
+/* ---- B: object-space marching against the real cylinder ----------------- */
+/* This is what produces a silhouette: the ray is traced through the actual
+   curved shell, so it can leave the object entirely and hit nothing.        */
+#define MAXI 768
+bool marchObject(vec3 O, vec3 D, float t0, float t1, bool solid, out vec3 hitP, out float iters){
+  vec3 P0 = O + D * t0;
+  vec3 N0 = uGeom == 0 ? vec3(0,0,1) : normalize(vec3(P0.x, 0.0, P0.z));
+  // the floor only binds on near-tangent rays, which really do cross a long
+  // chord of the shell; everywhere else the slider sets the step size outright
+  float budget = stepsFor(dot(-D, N0));
+  float dt = max(uH / budget, (t1 - t0) / float(MAXI - 8));
+  float t = t0, prevT = t0;
+  float prevF = fieldAt(P0);
+  if (prevF <= 0.0){ hitP = P0; iters = 0.0; return true; }
+
+  // heat reports iterations as a fraction of this pixel's own budget, matching
+  // marchTangent's i/n. Scaling by distance instead pinned everything to the
+  // bottom of the ramp, so the diagnostic view read a uniform blue.
+  float i = 0.0;
+  for (int k = 0; k < MAXI; k++){
+    t += dt; i += 1.0;
+    if (t > t1) break;
+    vec3 P = O + D * t;
+    // a wall is bounded: leaving its footprint is a miss, and that is what
+    // lets relief bite into the edge of an otherwise straight-edged quad
+    if (uGeom == 0 && (abs(P.x) > 1.0 || abs(P.y) > 1.0)) break;
+    float f = fieldAt(P);
+    if (f <= 0.0){
+      float w = prevF / (prevF - f);          // linear refine of the crossing
+      hitP = O + D * mix(prevT, t, clamp(w, 0.0, 1.0));
+      iters = i / max(budget, 1.0);
+      return true;
+    }
+    prevF = f; prevT = t;
+  }
+  iters = i / max(budget, 1.0);
+  // reaching the shell floor means we are inside the material, not outside it;
+  // reporting a miss there would punch holes through the middle of the surface
+  if (solid && t >= t1){ hitP = O + D * t1; return true; }
+  return false;                                // <-- the silhouette
+}
+
+/* ---- tangent frame at a point on the hull ------------------------------- */
+void frameAt(vec3 P, out vec3 T, out vec3 B, out vec3 N){
+  if (uGeom == 0){ T = vec3(1,0,0); B = vec3(0,1,0); N = vec3(0,0,1); return; }
+  N = normalize(vec3(P.x, 0.0, P.z));
+  T = vec3(-N.z, 0.0, N.x);
+  B = vec3(0,1,0);
+}
+
+float selfShadow(vec2 uv, vec3 Lt, vec2 sc){
+  if (Lt.z <= 0.03) return 0.0;
+  const int N = 20;
+  float h0 = 1.0 - heightAt(uv);
+  if (h0 <= 0.003) return 1.0;
+  float dH = h0 / float(N);
+  vec2  dUV = (Lt.xy / Lt.z) * sc * dH;
+  float occ = 0.0, rayH = h0; vec2 cur = uv;
+  for (int k = 1; k <= N; k++){
+    cur += dUV; rayH -= dH;
+    float d = 1.0 - heightAt(cur);
+    if (d < rayH) occ = max(occ, (rayH - d) * (1.0 - float(k) / float(N)));
+  }
+  return 1.0 - clamp(occ * 9.0, 0.0, 1.0);
+}
+
+void main(){
+  int mode = (uCompare && gl_FragCoord.x > uSplit) ? uModeB : uModeA;
+
+  vec3 O = uCam;
+  vec3 D = normalize(vWorld - uCam);
+  float t0, t1; bool solid;
+  if (!hitHull(O, D, t0, t1, solid)) discard;
+
+  vec3  hitP;
+  vec2  uv;
+  float iters = 0.0;
+
+  if (mode == 5){
+    /* --- object-space relief march: real silhouette --- */
+    if (!marchObject(O, D, t0, t1, solid, hitP, iters)) discard;
+    uv = uvOf(hitP);
+  } else {
+    /* --- everything else works on the flat tangent-space approximation --- */
+    hitP = O + D * t0;
+    uv = uvOf(hitP);
+    vec3 T, B, N; frameAt(hitP, T, B, N);
+    vec3 V  = -D;
+    vec3 Vt = normalize(vec3(dot(V, T), dot(V, B), dot(V, N)));
+    vec2 sc = uH / wpu();
+
+    if (mode == 1){                                   // naive: the /V.z blows up
+      uv -= (Vt.xy / max(Vt.z, 0.001)) * ((1.0 - heightAt(uv)) * sc);
+      iters = 1.0 / float(uSteps);
+    } else if (mode == 2){                            // Welsh: drop the divide
+      uv -= Vt.xy * ((1.0 - heightAt(uv)) * sc);
+      iters = 1.0 / float(uSteps);
+    } else if (mode == 3){
+      uv = marchTangent(uv, Vt, sc, false, iters);
+    } else if (mode == 4){
+      uv = marchTangent(uv, Vt, sc, true,  iters);
+    }
+  }
+
+  if (uHeat){ frag = vec4(heat(iters), 1.0); return; }
+
+  /* derivatives are garbage across the cylinder's atan seam and across the
+     split line, so clamp them rather than letting the mip level explode */
+  vec2 dx = dFdx(uv), dy = dFdy(uv), lim = tiles() * 0.25;
+  dx = clamp(dx, -lim, lim); dy = clamp(dy, -lim, lim);
+  vec3 alb = textureGrad(uAlb, uv, dx, dy).rgb;
+  vec3 nt  = normalize(textureGrad(uNrm, uv, dx, dy).xyz * 2.0 - 1.0);
+
+  vec3 T, B, N; frameAt(hitP, T, B, N);
+  vec3 Nw = normalize(T * nt.x + B * nt.y + N * nt.z);
+  vec3 Vw = normalize(uCam - hitP);
+  vec3 Lw = normalize(uLight - hitP);
+  vec3 Hw = normalize(Lw + Vw);
+
+  float sh = 1.0;
+  if (uShadow && mode >= 1){
+    vec3 Lt = normalize(vec3(dot(Lw, T), dot(Lw, B), dot(Lw, N)));
+    sh = selfShadow(uv, Lt, uH / wpu());
+  }
+
+  float dif  = max(dot(Nw, Lw), 0.0);
+  float spec = pow(max(dot(Nw, Hw), 0.0), 42.0) * 0.20;
+  float rim  = pow(1.0 - max(dot(Nw, Vw), 0.0), 4.0) * 0.05;
+  vec3  c = alb * (0.16 + dif * 1.10 * sh) + (spec * sh + rim);
+  c = pow(c, vec3(1.0 / 2.2));
+
+  if (uCompare && abs(gl_FragCoord.x - uSplit) < 1.0) c = vec3(1.0);
+  frag = vec4(c, 1.0);
+}`;
+
+const BG_VS = `#version 300 es
+const vec2 P[3] = vec2[3](vec2(-1.,-1.), vec2(3.,-1.), vec2(-1.,3.));
+out vec2 vP;
+void main(){ vP = P[gl_VertexID]; gl_Position = vec4(P[gl_VertexID], 0.999, 1.0); }`;
+
+const BG_FS = `#version 300 es
+precision mediump float; in vec2 vP; out vec4 frag;
+void main(){
+  vec3 c = mix(vec3(0.055,0.065,0.090), vec3(0.115,0.125,0.155), vP.y * 0.5 + 0.5);
+  c *= 1.0 - 0.28 * dot(vP, vP) * 0.5;
+  frag = vec4(c, 1.0);
+}`;
+
+/* ============================================================
+   Boot
+   ============================================================ */
+const canvas = document.getElementById("gl");
+const gl = canvas.getContext("webgl2", { antialias: true, alpha: false });
+if (!gl) {
+  document.body.innerHTML =
+    '<div style="margin:auto;padding:40px;font:14px system-ui;color:#e6e9f2">' +
+    'This demo needs <b>WebGL 2</b>, which this browser did not provide.</div>';
+  throw new Error("no webgl2");
+}
+
+function compile(vsSrc, fsSrc) {
+  const p = gl.createProgram();
+  for (const [type, src] of [[gl.VERTEX_SHADER, vsSrc], [gl.FRAGMENT_SHADER, fsSrc]]) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    gl.attachShader(p, s);
+  }
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+
+const prog = compile(VS, FS), bgProg = compile(BG_VS, BG_FS);
+const U = {};
+for (const n of ["uProj","uView","uCam","uLight","uAlb","uNrm","uH","uSplit","uTile",
+                 "uIndep","uSteps","uModeA","uModeB","uGeom","uCompare","uShadow","uHeat"]) {
+  U[n] = gl.getUniformLocation(prog, n);
+}
+
+function mkVao(data) {
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const b = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, b);
+  gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 12, 0);
+  gl.bindVertexArray(null);
+  return { vao, count: data.length / 3 };
+}
+const MESH = [mkVao(wallMesh()), mkVao(towerMesh(96))];
+const bgVao = gl.createVertexArray();
+
+// generating a material costs JS time, so only build one when it is asked for
+const SAMPLERS = { rock: sampleRock, brick: sampleBrick };
+const matCache = {};
+const getMaterial = (kind) => {
+  // the scan decodes asynchronously; fall back to procedural stone until ready
+  if (kind === "scan") return scanMat.ready ? scanMat : getMaterial("rock");
+  return (matCache[kind] ||= buildMaterial(gl, SAMPLERS[kind]));
+};
+
+/* ---- state ---- */
+const MODES = [
+  "Normal mapping only",
+  "Parallax (naive, /V.z)",
+  "Parallax + offset limiting",
+  "Steep parallax mapping",
+  "Parallax occlusion mapping",
+  "Silhouette POM (SilPOM)",
+];
+const S = {
+  geom: 1, mat: "scan", modeA: 4, modeB: 5, compare: true, split: 0.5,
+  depth: 0.13, steps: 24, tile: 1, indep: 0.75,
+  shadow: true, heat: false, sweep: true,
+  la: 0.9, le: 0.40,
+  yaw: 0.55, pitch: 0.10, dist: 3.6,
+};
+
+const $ = (id) => document.getElementById(id);
+for (const sel of [$("modeA"), $("modeB")]) MODES.forEach((m, i) => sel.add(new Option(m, String(i))));
+$("modeA").value = S.modeA; $("modeB").value = S.modeB;
+$("compare").checked = S.compare;
+$("depth").value = S.depth; $("steps").value = S.steps; $("tile").value = S.tile;
+$("indep").value = S.indep;
+$("shadow").checked = S.shadow; $("heat").checked = S.heat; $("sweep").checked = S.sweep;
+$("la").value = S.la; $("le").value = S.le;
+
+function syncUI() {
+  // set an explicit value, never "" — an empty inline style falls back to the
+  // stylesheet, which declares display:none for #labB and #handle
+  // drive the selects FROM state, so anything that sets S.modeA directly
+  // (the presets, the quality profiles, the console probe) stays consistent
+  $("modeA").value = S.modeA; $("modeB").value = S.modeB;
+  $("labA").textContent = S.compare ? "A · " + MODES[S.modeA] : MODES[S.modeA];
+  $("labB").textContent = MODES[S.modeB] + " · B";
+  $("labB").style.display   = S.compare ? "block" : "none";
+  $("wrapB").style.display  = S.compare ? "block" : "none";
+  $("handle").style.display = S.compare ? "block" : "none";
+  $("handle").style.left = (S.split * 100) + "%";
+  $("oDepth").textContent = S.depth.toFixed(3);
+  $("oSteps").textContent = S.steps;
+  $("oIndep").textContent = S.indep.toFixed(2);
+  $("oTile").textContent  = S.tile + "×";
+  $("oLa").textContent = (S.la * 57.3).toFixed(0) + "°";
+  $("oLe").textContent = (S.le * 57.3).toFixed(0) + "°";
+
+  const marching = S.modeA >= 3 || (S.compare && S.modeB >= 3);
+  $("steps").disabled = !marching;
+  $("indep").disabled = !marching;
+  $("rowSteps").classList.toggle("off", !marching);
+  $("rowIndep").classList.toggle("off", !marching);
+  for (const b of document.querySelectorAll("#geom button"))
+    b.classList.toggle("on", +b.dataset.g === S.geom);
+  for (const b of document.querySelectorAll("#mats button"))
+    b.classList.toggle("on", b.dataset.m === S.mat);
+  $("matNote").innerHTML =
+    S.mat !== "scan"
+      ? "Procedural. Irregular stone reads displacement far more strongly than a "
+        + "repeating running bond, which looks like a pattern rather than a surface."
+      : scanMat.failed
+        ? "<b style='color:#ffbe7a'>Scan unavailable</b> — texture-data.js did not load; "
+          + "showing procedural stone instead."
+        : scanMat.ready
+          ? "Photogrammetry scan, 2048² diffuse + 16-bit displacement. "
+            + (window.ROCKWALL ? window.ROCKWALL.credit : "")
+          : "Decoding scan…";
+
+  // a flat quad has no outline to carve — say so instead of quietly doing nothing
+  const wantsSilo = S.modeA === 5 || (S.compare && S.modeB === 5);
+  const w = $("warn");
+  w.style.display = (wantsSilo && S.geom === 0) ? "block" : "none";
+  w.textContent = "Silhouette POM on a flat wall only erodes the quad border — "
+                + "switch to Tower to see the outline actually break.";
+}
+
+const clearProfile = () =>
+  document.querySelectorAll("#profiles button.on").forEach(o => o.classList.remove("on"));
+
+$("modeA").oninput = e => { S.modeA = +e.target.value; clearProfile(); syncUI(); };
+$("modeB").oninput = e => { S.modeB = +e.target.value; syncUI(); };
+$("compare").oninput = e => { S.compare = e.target.checked; syncUI(); };
+$("depth").oninput  = e => { S.depth = +e.target.value; syncUI(); };
+$("steps").oninput  = e => { S.steps = +e.target.value; syncUI(); };
+$("indep").oninput  = e => { S.indep = +e.target.value; syncUI(); };
+$("tile").oninput   = e => { S.tile = +e.target.value; syncUI(); };
+$("shadow").oninput = e => { S.shadow = e.target.checked; };
+$("heat").oninput   = e => { S.heat = e.target.checked; };
+$("sweep").oninput  = e => { S.sweep = e.target.checked; };
+$("la").oninput     = e => { S.la = +e.target.value; syncUI(); };
+$("le").oninput     = e => { S.le = +e.target.value; syncUI(); };
+
+for (const b of document.querySelectorAll("#mats button")) {
+  b.onclick = () => { S.mat = b.dataset.m; if (S.mat !== "scan") getMaterial(S.mat); syncUI(); };
+}
+
+for (const b of document.querySelectorAll("#geom button")) {
+  b.onclick = () => {
+    S.geom = +b.dataset.g; S.dist = S.geom ? 3.6 : 2.9;
+    S.pitch = clampPitch(S.pitch); syncUI();
+  };
+}
+
+const PROFILES = {
+  Low:   { mode: 0, steps: 8,  shadow: false },
+  Med:   { mode: 2, steps: 8,  shadow: false },
+  High:  { mode: 4, steps: 20, shadow: true  },
+  Ultra: { mode: 5, steps: 32, shadow: true  },
+};
+for (const b of document.querySelectorAll("#profiles button")) {
+  b.onclick = () => {
+    const p = PROFILES[b.dataset.p];
+    S.modeA = p.mode; S.steps = p.steps; S.shadow = p.shadow;
+    $("modeA").value = p.mode; $("steps").value = p.steps; $("shadow").checked = p.shadow;
+    for (const o of document.querySelectorAll("#profiles button")) o.classList.toggle("on", o === b);
+    syncUI();
+  };
+}
+
+for (const b of document.querySelectorAll(".btns button")) {
+  b.onclick = () => {
+    S.modeA = +b.dataset.a; S.modeB = +b.dataset.b; S.compare = true;
+    if (b.dataset.g !== undefined) {
+      S.geom = +b.dataset.g; S.dist = S.geom ? 3.6 : 2.9; S.pitch = clampPitch(S.pitch);
+    }
+    $("modeA").value = S.modeA; $("modeB").value = S.modeB; $("compare").checked = true;
+    // steep parallax only shows its banding when the layers are coarse
+    if (S.modeA === 3 || S.modeB === 3) { S.steps = 10; $("steps").value = 10; }
+    clearProfile(); syncUI();
+  };
+}
+
+/* ---- camera ---- */
+// the tower is an open tube with no end caps, so keep the eye near its equator
+const clampPitch = (p) => {
+  const lim = S.geom ? 0.42 : 1.30;
+  return Math.max(-lim, Math.min(lim, p));
+};
+let dragging = false, px = 0, py = 0;
+canvas.addEventListener("pointerdown", e => {
+  dragging = true; px = e.clientX; py = e.clientY;
+  canvas.setPointerCapture(e.pointerId); canvas.classList.add("drag");
+  S.sweep = false; $("sweep").checked = false;
+});
+canvas.addEventListener("pointermove", e => {
+  if (!dragging) return;
+  // grab-the-object, not move-the-camera: the surface under the cursor tracks the
+  // cursor, so both deltas are subtracted from the orbit angles rather than added
+  S.yaw -= (e.clientX - px) * 0.006;
+  S.pitch = clampPitch(S.pitch + (e.clientY - py) * 0.006);
+  if (S.geom === 0) S.yaw = Math.max(-1.48, Math.min(1.48, S.yaw));
+  px = e.clientX; py = e.clientY;
+});
+const endDrag = () => { dragging = false; canvas.classList.remove("drag"); };
+canvas.addEventListener("pointerup", endDrag);
+canvas.addEventListener("pointercancel", endDrag);
+canvas.addEventListener("wheel", e => {
+  e.preventDefault();
+  S.dist = Math.max(1.7, Math.min(9, S.dist * (1 + Math.sign(e.deltaY) * 0.09)));
+}, { passive: false });
+
+const handle = $("handle");
+let hDrag = false;
+handle.addEventListener("pointerdown", e => { hDrag = true; handle.setPointerCapture(e.pointerId); e.stopPropagation(); });
+handle.addEventListener("pointermove", e => {
+  if (!hDrag) return;
+  const r = canvas.getBoundingClientRect();
+  S.split = Math.max(0.04, Math.min(0.96, (e.clientX - r.left) / r.width));
+  handle.style.left = (S.split * 100) + "%";
+});
+handle.addEventListener("pointerup", () => { hDrag = false; });
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.max(1, canvas.clientWidth * dpr) | 0;
+  const h = Math.max(1, canvas.clientHeight * dpr) | 0;
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+}
+window.addEventListener("resize", resize);
+
+/* ---- frame loop ---- */
+let last = performance.now(), fps = 60, frames = 0, acc = 0, lastCam = [0, 0, 1];
+const hud = $("hud");
+
+let paused = false;
+function frame(now) {
+  if (paused) { requestAnimationFrame(frame); return; }
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  acc += dt; frames++;
+  if (acc > 0.5) { fps = frames / acc; frames = 0; acc = 0; updateHud(); }
+
+  if (S.sweep) S.yaw = S.geom ? S.yaw + dt * 0.30 : Math.sin(now * 0.00045) * 1.42;
+
+  resize();
+  drawScene();
+  requestAnimationFrame(frame);
+}
+
+function drawScene() {
+  gl.viewport(0, 0, canvas.width, canvas.height);
+
+  gl.disable(gl.DEPTH_TEST); gl.depthMask(false); gl.disable(gl.CULL_FACE);
+  gl.useProgram(bgProg); gl.bindVertexArray(bgVao);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  gl.depthMask(true); gl.enable(gl.DEPTH_TEST);
+  gl.clear(gl.DEPTH_BUFFER_BIT);
+  // the tower is a closed hull, so cull its far side; the wall is single-sided
+  if (S.geom) { gl.enable(gl.CULL_FACE); gl.cullFace(gl.BACK); gl.frontFace(gl.CCW); }
+
+  const cp = Math.cos(S.pitch);
+  const cam = [Math.sin(S.yaw) * cp * S.dist, Math.sin(S.pitch) * S.dist, Math.cos(S.yaw) * cp * S.dist];
+  const light = [
+    Math.cos(S.le) * Math.sin(S.la) * 5.0,
+    Math.sin(S.le) * 5.0,
+    Math.cos(S.le) * Math.cos(S.la) * 5.0,
+  ];
+  lastCam = cam;
+
+  const m = MESH[S.geom];
+  gl.useProgram(prog); gl.bindVertexArray(m.vao);
+  gl.uniformMatrix4fv(U.uProj, false, perspective(0.82, canvas.width / canvas.height, 0.05, 40));
+  gl.uniformMatrix4fv(U.uView, false, lookAt(cam, [0, 0, 0], [0, 1, 0]));
+  gl.uniform3fv(U.uCam, cam);
+  gl.uniform3fv(U.uLight, light);
+  gl.uniform1f(U.uH, S.depth);
+  gl.uniform1f(U.uSplit, S.split * canvas.width);
+  gl.uniform1f(U.uTile, S.tile);
+  gl.uniform1f(U.uIndep, S.indep);
+  gl.uniform1i(U.uSteps, S.steps);
+  gl.uniform1i(U.uModeA, S.modeA);
+  gl.uniform1i(U.uModeB, S.modeB);
+  gl.uniform1i(U.uGeom, S.geom);
+  gl.uniform1i(U.uCompare, S.compare ? 1 : 0);
+  gl.uniform1i(U.uShadow, S.shadow ? 1 : 0);
+  gl.uniform1i(U.uHeat, S.heat ? 1 : 0);
+  const mat = getMaterial(S.mat);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, mat.albedo); gl.uniform1i(U.uAlb, 0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, mat.normal); gl.uniform1i(U.uNrm, 1);
+  gl.drawArrays(gl.TRIANGLES, 0, m.count);
+}
+
+/* Shader-cost probe, console only: benchAll([{mode,steps,geom,shadow}, ...]).
+   Three things had to be true before the numbers meant anything:
+     - the rAF loop must stop, or its draws land inside the timed region;
+     - the drawing buffer must be sized ONCE, not per config — reallocating it
+       costs more than the frame being measured;
+     - configs must be interleaved over several passes and reduced with min(),
+       because this GPU throttles steadily under load and a single ascending
+       sweep charges the drift to whichever config ran last.
+   readPixels is the sync point; gl.finish() is advisory in WebGL and will
+   happily report CPU-side submit time instead of the GPU's. */
+const px1 = new Uint8Array(4);
+window.benchAll = (cfgs, { reps = 20, passes = 5, w = 1280, h = 720 } = {}) => {
+  const save = { ...S }, sc = { w: canvas.width, h: canvas.height };
+  paused = true;
+  canvas.width = w; canvas.height = h;
+  const best = cfgs.map(() => Infinity);
+  const run = (c, n) => {
+    // the draw reads modeA; accepting a bare `mode` here silently benchmarked
+    // whatever modeA already was, making every row of the table identical
+    const { mode, ...rest } = c;
+    Object.assign(S, { compare: false, sweep: false, heat: false }, rest);
+    if (mode !== undefined) S.modeA = mode;
+    const t0 = performance.now();
+    for (let i = 0; i < n; i++) drawScene();
+    gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px1);
+    return (performance.now() - t0) / n;
+  };
+  cfgs.forEach(c => run(c, 4));                       // warm up / compile all
+  // Alternate the sweep direction. This GPU's clock sags monotonically under
+  // load, so a fixed order charges the whole drift to whatever ran last — which
+  // showed up as "normal mapping costs 2x more at 128 steps", a mode that does
+  // not read uSteps at all. Reversing every other pass lets min() cancel it.
+  for (let p = 0; p < passes; p++) {
+    const order = cfgs.map((_, i) => i);
+    if (p & 1) order.reverse();
+    for (const i of order) best[i] = Math.min(best[i], run(cfgs[i], reps));
+  }
+  Object.assign(S, save); canvas.width = sc.w; canvas.height = sc.h;
+  paused = false;
+  return best.map(v => +v.toFixed(3));
+};
+
+function updateHud() {
+  const l = Math.hypot(lastCam[0], lastCam[1], lastCam[2]) || 1;
+  const graze = Math.acos(Math.min(1, Math.abs(lastCam[2]) / l)) * 57.2958;
+  hud.innerHTML = `<b>${fps.toFixed(0)}</b> fps` +
+    (S.geom ? "" : ` &nbsp;·&nbsp; view <b>${graze.toFixed(0)}°</b> off-normal`) +
+    `&nbsp;·&nbsp; drag = orbit, wheel = zoom`;
+}
+
+syncUI();
+loadScan(syncUI);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
