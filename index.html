@@ -4,6 +4,18 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Parallax Mapping vs. Real Displacement — Offset Limiting, POM &amp; Silhouettes</title>
+<meta name="description" content="Interactive WebGL2 comparison of the parallax-mapping family — normal mapping, offset limiting, parallax occlusion mapping and silhouette-cutting relief — side by side on one surface, with measured costs.">
+<!-- Inline so the page stays a single file and the browser's implicit favicon
+     request does not 404: a light quad offset from a dark one, which is the
+     whole trick in one glyph. -->
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' fill='%230b0e13'/><rect x='6' y='12' width='18' height='14' rx='2' fill='%232e3947'/><rect x='9' y='7' width='18' height='14' rx='2' fill='%23c8d4e3'/></svg>">
+<!-- Absolute, because link unfurlers do not resolve relative paths. Harmless
+     offline; only affects how a shared link previews. -->
+<meta property="og:type" content="website">
+<meta property="og:title" content="Parallax Mapping vs. Real Displacement">
+<meta property="og:description" content="Six relief techniques side by side on one surface, with measured costs. Single file, no build step.">
+<meta property="og:image" content="https://mfagerlund.github.io/parallax-mapping-demo/docs/hero.jpg">
+<meta name="twitter:card" content="summary_large_image">
 <style>
   :root{
     --bg:#0b0d12; --panel:#12151d; --panel2:#171b26; --line:#242938;
