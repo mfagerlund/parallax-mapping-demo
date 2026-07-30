@@ -17,8 +17,10 @@ of the shape. Right: stones break the outline.*
 
 ## Try it
 
-Open `index.html` in any browser. No server, no build step, no network, no
-install.
+### **[→ Live demo](https://mfagerlund.github.io/parallax-mapping-demo/)**
+
+Or clone the repo and open `index.html` directly — no server, no build step, no
+network, no install.
 
 - **Drag** to orbit, **wheel** to zoom.
 - **Technique** picks the two shaders being compared; **drag the white handle**
@@ -232,8 +234,10 @@ were flattened at capture time.
 
 **Why the texture is a `.js` file.** Firefox gives every `file://` document a
 unique opaque origin, so a sibling `.jpg` counts as cross-origin and tainting
-blocks the texture upload. Data URIs stay same-origin. If `texture-data.js` is
-missing the demo falls back to procedural stone and says so in the panel.
+blocks the texture upload. Data URIs stay same-origin. The restriction does not
+apply to the hosted version, which is served over https, but it uses the same
+data URI so there is only one code path. If `texture-data.js` is missing the demo
+falls back to procedural stone and says so in the panel.
 
 **Benchmarking.** `benchAll([{geom:1, mode:4, steps:32}, ...])` from the console.
 It pauses the render loop, sizes the buffer once, and sweeps configurations in
