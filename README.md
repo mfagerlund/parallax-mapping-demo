@@ -7,6 +7,9 @@ for this, they cost wildly different amounts, and they fail in different ways.
 This is an interactive demo of that family, side by side on the same surface, so
 you can see exactly what each one buys and where each one breaks.
 
+**It runs in your browser — [open the live demo](https://mfagerlund.github.io/parallax-mapping-demo/).
+Nothing to download, install, or build.**
+
 ![Parallax occlusion mapping on the left, silhouette POM on the right — the left
 limb is a clean curve, the right limb is broken by protruding
 stones](docs/hero.jpg)
@@ -116,9 +119,26 @@ normal mapping:
 | Cylinder — silhouette POM | +3.1 | +4.4 | +7.5 | +10.7 | +19.7 |
 
 Offset limiting is effectively free and does not care about sample count. POM
-scales linearly. **Silhouette POM costs roughly 2.2× POM on a flat wall and 3× on
-a cylinder**, because rays near the outline cross a long slice of the surface
-instead of plunging straight through it.
+scales linearly. **Silhouette POM costs roughly 3× POM on a cylinder**, because
+rays near the outline cross a long slice of the surface instead of plunging
+straight through it. The flat-wall multiplier in that table is the least
+trustworthy number in it — see the cross-check below.
+
+### Cross-checked on an RTX 4090
+
+On a discrete GPU the whole family is free. At 1920×1080, measured as real GPU
+time, POM on the cylinder costs **0.07 ms/frame** at 32 samples and silhouette
+POM **0.17 ms** — 0.4% and 1.0% of a 60 fps frame budget. That is why the
+integrated-GPU table above is the one worth reasoning about: it is the only place
+the cost is legible at all.
+
+Two of its claims reproduced on that hardware: offset limiting is free and
+sample-count independent, and silhouette POM costs 2.2–3.3× POM on the cylinder.
+The flat-wall figure did **not** — the 4090 puts silhouette POM at roughly 1× POM
+there, at every sample count. That is physically reasonable, since a wall has no
+outline to carve, so read the wall row as an upper bound rather than a
+measurement. Those numbers come from `EXT_disjoint_timer_query_webgl2`, not from
+`benchAll`; the implementation notes explain why that distinction matters.
 
 The **Step-cost heatmap** checkbox shows where the samples actually go:
 
@@ -243,6 +263,18 @@ falls back to procedural stone and says so in the panel.
 It pauses the render loop, sizes the buffer once, and sweeps configurations in
 alternating order reduced with `min()` — this GPU's clock sags under sustained
 load, and a fixed-order sweep charges all the drift to whatever ran last.
+
+**`benchAll` is wall-clock, and that breaks on a fast GPU.** It times a batch of
+submitted frames bounded by a single `readPixels` sync, so what it really measures
+is whichever of CPU submission and GPU execution is slower. On an integrated GPU
+that is the GPU, and the numbers mean something. On an RTX 4090 it is the CPU, and
+the output goes visibly impossible: 1920×1080 measuring cheaper than 960×540, a
+march whose marginal cost *falls* as pixel count rises, and at 7680×4320 plain
+normal mapping timing slower than the POM that strictly adds work on top of it. To
+re-measure on a discrete card, use real GPU timing —
+`EXT_disjoint_timer_query_webgl2`, which Chrome exposes under
+`--enable-webgl-draft-extensions` — and treat any delta that ignores resolution as
+a broken instrument rather than a result.
 
 **A gotcha worth generalising.** Two separate bugs here were safety clamps
 quietly becoming the real value: a step-size floor derived from a far-too-generous
