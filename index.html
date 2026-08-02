@@ -182,6 +182,8 @@
     <input type="range" id="indep" min="0" max="1" step="0.05">
     <div class="row"><label>Tiling</label><output id="oTile"></output></div>
     <input type="range" id="tile" min="1" max="3" step="1">
+    <div class="row" id="rowGrid"><label>SSD screen grid</label><output id="oGrid"></output></div>
+    <input type="range" id="grid" min="1" max="6" step="1">
   </div>
 
   <div class="grp">
@@ -218,7 +220,7 @@
     <div class="ttl">Compare presets</div>
     <p class="note" style="margin:-2px 0 8px">
       Shortcuts only &mdash; each just sets the two <em>Technique</em> dropdowns above,
-      which take any of the six modes in either slot.
+      which take any of the seven modes in either slot.
     </p>
     <div class="btns">
       <button data-a="1" data-b="2">Naive vs. offset-limited</button>
@@ -226,6 +228,8 @@
       <button data-a="3" data-b="4">Steep vs. POM (banding)</button>
       <button data-a="4" data-b="5" data-g="1">POM vs. silhouette POM</button>
       <button data-a="0" data-b="5" data-g="1">Flat vs. silhouette POM</button>
+      <button data-a="4" data-b="6" data-g="1">POM vs. screen-space displ.</button>
+      <button data-a="5" data-b="6" data-g="1">SilPOM vs. screen-space displ.</button>
     </div>
   </div>
 
@@ -252,6 +256,45 @@
       <code>gl_FragDepth</code>, so the depth buffer keeps the <em>undisplaced
       hull's</em> depth — silently wrong rather than merely absent.
       Most engines take the geometry path &mdash; see the cost notes in the README.
+    </p>
+  </div>
+
+  <div class="grp">
+    <div class="ttl">Screen-space displacement</div>
+    <p class="note">
+      Mode 6 is the odd one out: it is not a relief shader. The hull is rasterized
+      into a G-buffer, then a grid of triangles <em>one cell per screen pixel</em>
+      is drawn, each node pushed along the normal by the height map.
+    </p>
+    <p class="note">
+      So it really is displaced geometry — it just takes its tessellation density
+      from the framebuffer instead of the mesh. Hence "infinite detail without the
+      memory": there is no subdivided mesh to store, and cost is a function of
+      resolution alone. Turn on the <b>heatmap</b> and it reads flat, because every
+      pixel does exactly one displacement no matter what the height map says.
+    </p>
+    <p class="note">
+      It also writes <em>correct depth</em>, for free, which SilPOM does not — the
+      rasterizer wrote it. That single difference removes most of the objections
+      listed above.
+    </p>
+    <p class="note">
+      What it cannot do is invent surface it never saw. The grid is a height field
+      over the camera's view, single-layered, so where displacement should tear the
+      surface open it <em>stretches</em> instead. Push <code>Depth</code> up and
+      watch the smearing along the limb. Nodes at the viewport border have no
+      neighbours, which is the screen-edge artifact.
+    </p>
+    <p class="note">
+      And the vertices move without telling anyone downstream. A temporal upscaler
+      reprojects them using motion vectors belonging to the <em>undisplaced</em>
+      surface, which is the shimmer Crimson Desert shipped with and patched later.
+      This demo has no TAA, so it does not show that one.
+    </p>
+    <p class="note">
+      <b>SSD screen grid</b> sets the cell size in device pixels — the tessellation
+      knob. At 1 px the outline is exact and the cost is millions of triangles; the
+      HUD reports what was actually drawn.
     </p>
   </div>
 </aside>
@@ -581,24 +624,20 @@ uniform mat4 uProj, uView;
 out vec3 vWorld;
 void main(){ vWorld = aPos; gl_Position = uProj * uView * vec4(aPos, 1.0); }`;
 
-const FS = `#version 300 es
-precision highp float;
-in vec3 vWorld;
-uniform sampler2D uAlb, uNrm;
-uniform vec3  uCam, uLight;
-uniform float uH, uSplit, uTile, uIndep;
-uniform int   uSteps, uModeA, uModeB, uGeom;
-uniform bool  uCompare, uShadow, uHeat;
-out vec4 frag;
+/* Surface parameterisation, the height field, and the tangent frame. Shared
+   verbatim between the relief shader and the screen-space displacement pass —
+   the two have to agree exactly, or a split-screen comparison stops comparing
+   the same surface.
+   Requires the includer to declare: sampler2D uAlb; float uH, uTile; int uGeom.
 
+   uvOf(P) : texture coords (already multiplied by tile count) at a point
+   wpu     : world units spanned by ONE texture repeat, per tangent axis.
+             Needed to convert a world-space depth into a UV offset.          */
+const COMMON_GEO = `
 const float TAU = 6.28318530718;
 const float R   = ${TOWER_R.toFixed(4)};
 const float TY  = ${TOWER_Y.toFixed(4)};
 
-/* ---- surface parameterisation -------------------------------------------
-   uvOf(P)   : texture coords (already multiplied by tile count) at a point
-   wpu       : world units spanned by ONE texture repeat, per tangent axis.
-               Needed to convert a world-space depth into a UV offset.       */
 // tower ratio 3:2 keeps texels square-ish: circumference 2*PI*R vs height 2*TY
 vec2 tiles(){ return uGeom == 0 ? vec2(uTile) : vec2(3.0 * uTile, 2.0 * uTile); }
 vec2 wpu(){
@@ -612,6 +651,78 @@ vec2 uvOf(vec3 P){
 }
 float heightAt(vec2 uv){ return textureLod(uAlb, uv, 0.0).a; }
 
+/* ---- tangent frame at a point on the hull ------------------------------- */
+void frameAt(vec3 P, out vec3 T, out vec3 B, out vec3 N){
+  if (uGeom == 0){ T = vec3(1,0,0); B = vec3(0,1,0); N = vec3(0,0,1); return; }
+  N = normalize(vec3(P.x, 0.0, P.z));
+  T = vec3(-N.z, 0.0, N.x);
+  B = vec3(0,1,0);
+}
+
+vec3 heat(float t){
+  t = clamp(t, 0.0, 1.0);
+  return clamp(vec3(1.5 - abs(4.0*t - 3.0), 1.5 - abs(4.0*t - 2.0), 1.5 - abs(4.0*t - 1.0)), 0.0, 1.0);
+}
+`;
+
+/* Lighting, shared the same way. Fragment stage only — it takes derivatives.
+   Additionally requires: sampler2D uNrm; vec3 uCam, uLight.                  */
+const COMMON_SHADE = `
+float selfShadow(vec2 uv, vec3 Lt, vec2 sc){
+  if (Lt.z <= 0.03) return 0.0;
+  const int N = 20;
+  float h0 = 1.0 - heightAt(uv);
+  if (h0 <= 0.003) return 1.0;
+  float dH = h0 / float(N);
+  vec2  dUV = (Lt.xy / Lt.z) * sc * dH;
+  float occ = 0.0, rayH = h0; vec2 cur = uv;
+  for (int k = 1; k <= N; k++){
+    cur += dUV; rayH -= dH;
+    float d = 1.0 - heightAt(cur);
+    if (d < rayH) occ = max(occ, (rayH - d) * (1.0 - float(k) / float(N)));
+  }
+  return 1.0 - clamp(occ * 9.0, 0.0, 1.0);
+}
+
+vec3 shadeSurface(vec3 hitP, vec2 uv, bool wantShadow){
+  /* derivatives are garbage across the cylinder's atan seam and across the
+     split line, so clamp them rather than letting the mip level explode */
+  vec2 dx = dFdx(uv), dy = dFdy(uv), lim = tiles() * 0.25;
+  dx = clamp(dx, -lim, lim); dy = clamp(dy, -lim, lim);
+  vec3 alb = textureGrad(uAlb, uv, dx, dy).rgb;
+  vec3 nt  = normalize(textureGrad(uNrm, uv, dx, dy).xyz * 2.0 - 1.0);
+
+  vec3 T, B, N; frameAt(hitP, T, B, N);
+  vec3 Nw = normalize(T * nt.x + B * nt.y + N * nt.z);
+  vec3 Vw = normalize(uCam - hitP);
+  vec3 Lw = normalize(uLight - hitP);
+  vec3 Hw = normalize(Lw + Vw);
+
+  float sh = 1.0;
+  if (wantShadow){
+    vec3 Lt = normalize(vec3(dot(Lw, T), dot(Lw, B), dot(Lw, N)));
+    sh = selfShadow(uv, Lt, uH / wpu());
+  }
+
+  float dif  = max(dot(Nw, Lw), 0.0);
+  float spec = pow(max(dot(Nw, Hw), 0.0), 42.0) * 0.20;
+  float rim  = pow(1.0 - max(dot(Nw, Vw), 0.0), 4.0) * 0.05;
+  return pow(alb * (0.16 + dif * 1.10 * sh) + (spec * sh + rim), vec3(1.0 / 2.2));
+}
+`;
+
+const FS = `#version 300 es
+precision highp float;
+in vec3 vWorld;
+uniform sampler2D uAlb, uNrm;
+uniform vec3  uCam, uLight;
+uniform float uH, uSplit, uTile, uIndep;
+uniform int   uSteps, uModeA, uModeB, uGeom;
+uniform bool  uCompare, uShadow, uHeat;
+out vec4 frag;
+
+${COMMON_GEO}
+
 /* Signed INSIDE/OUTSIDE test, >0 outside the material. Deliberately not a true
    signed-distance field: it measures along one axis only (z for the wall, radius
    for the tower), so its magnitude overstates the real distance on steep slopes.
@@ -621,11 +732,6 @@ float heightAt(vec2 uv){ return textureLod(uAlb, uv, 0.0).a; }
 float fieldAt(vec3 P){
   if (uGeom == 0) return P.z + (1.0 - heightAt(uvOf(P))) * uH;
   return length(P.xz) - (R - (1.0 - heightAt(uvOf(P))) * uH);
-}
-
-vec3 heat(float t){
-  t = clamp(t, 0.0, 1.0);
-  return clamp(vec3(1.5 - abs(4.0*t - 3.0), 1.5 - abs(4.0*t - 2.0), 1.5 - abs(4.0*t - 1.0)), 0.0, 1.0);
 }
 
 /* ---- ray vs. the undisplaced hull ---------------------------------------
@@ -748,32 +854,17 @@ bool marchObject(vec3 O, vec3 D, float t0, float t1, bool solid, out vec3 hitP, 
   return false;                                // <-- the silhouette
 }
 
-/* ---- tangent frame at a point on the hull ------------------------------- */
-void frameAt(vec3 P, out vec3 T, out vec3 B, out vec3 N){
-  if (uGeom == 0){ T = vec3(1,0,0); B = vec3(0,1,0); N = vec3(0,0,1); return; }
-  N = normalize(vec3(P.x, 0.0, P.z));
-  T = vec3(-N.z, 0.0, N.x);
-  B = vec3(0,1,0);
-}
-
-float selfShadow(vec2 uv, vec3 Lt, vec2 sc){
-  if (Lt.z <= 0.03) return 0.0;
-  const int N = 20;
-  float h0 = 1.0 - heightAt(uv);
-  if (h0 <= 0.003) return 1.0;
-  float dH = h0 / float(N);
-  vec2  dUV = (Lt.xy / Lt.z) * sc * dH;
-  float occ = 0.0, rayH = h0; vec2 cur = uv;
-  for (int k = 1; k <= N; k++){
-    cur += dUV; rayH -= dH;
-    float d = 1.0 - heightAt(cur);
-    if (d < rayH) occ = max(occ, (rayH - d) * (1.0 - float(k) / float(N)));
-  }
-  return 1.0 - clamp(occ * 9.0, 0.0, 1.0);
-}
+${COMMON_SHADE}
 
 void main(){
   int mode = (uCompare && gl_FragCoord.x > uSplit) ? uModeB : uModeA;
+
+  // mode 6 is not a relief shader at all — a separate screen-grid pass owns
+  // those pixels. Keep only the split rule, so the divider stays unbroken.
+  if (mode == 6){
+    if (uCompare && abs(gl_FragCoord.x - uSplit) < 1.0){ frag = vec4(1.0); return; }
+    discard;
+  }
 
   vec3 O = uCam;
   vec3 D = normalize(vWorld - uCam);
@@ -812,33 +903,127 @@ void main(){
 
   if (uHeat){ frag = vec4(heat(iters), 1.0); return; }
 
-  /* derivatives are garbage across the cylinder's atan seam and across the
-     split line, so clamp them rather than letting the mip level explode */
-  vec2 dx = dFdx(uv), dy = dFdy(uv), lim = tiles() * 0.25;
-  dx = clamp(dx, -lim, lim); dy = clamp(dy, -lim, lim);
-  vec3 alb = textureGrad(uAlb, uv, dx, dy).rgb;
-  vec3 nt  = normalize(textureGrad(uNrm, uv, dx, dy).xyz * 2.0 - 1.0);
-
-  vec3 T, B, N; frameAt(hitP, T, B, N);
-  vec3 Nw = normalize(T * nt.x + B * nt.y + N * nt.z);
-  vec3 Vw = normalize(uCam - hitP);
-  vec3 Lw = normalize(uLight - hitP);
-  vec3 Hw = normalize(Lw + Vw);
-
-  float sh = 1.0;
-  if (uShadow && mode >= 1){
-    vec3 Lt = normalize(vec3(dot(Lw, T), dot(Lw, B), dot(Lw, N)));
-    sh = selfShadow(uv, Lt, uH / wpu());
-  }
-
-  float dif  = max(dot(Nw, Lw), 0.0);
-  float spec = pow(max(dot(Nw, Hw), 0.0), 42.0) * 0.20;
-  float rim  = pow(1.0 - max(dot(Nw, Vw), 0.0), 4.0) * 0.05;
-  vec3  c = alb * (0.16 + dif * 1.10 * sh) + (spec * sh + rim);
-  c = pow(c, vec3(1.0 / 2.2));
-
+  vec3 c = shadeSurface(hitP, uv, uShadow && mode >= 1);
   if (uCompare && abs(gl_FragCoord.x - uSplit) < 1.0) c = vec3(1.0);
   frag = vec4(c, 1.0);
+}`;
+
+/* ============================================================
+   Screen-space displacement (mode 6)
+     Two passes, and the second one is the whole idea:
+
+       1. rasterize the undisplaced hull into a G-buffer holding its world
+          position (w = coverage). A real engine already has this.
+       2. draw a grid of triangles whose vertex density is the SCREEN, not the
+          mesh. Each grid node reads the hull position under it, pushes it
+          along the surface normal by the height map, and projects the result.
+
+     So it IS displaced geometry — it just gets its tessellation from the
+     framebuffer. That buys three things POM cannot have: the outline moves,
+     the depth buffer is correct because the rasterizer wrote it, and the cost
+     per frame is a function of resolution alone, not of what is on screen.
+
+     And it loses what screen space always loses. The grid is a height field
+     over the camera's view, single-layered: it can stretch but never tear
+     open, so anything the displacement should have revealed is smeared
+     instead. Nodes near the viewport border have no neighbours to interpolate
+     against. And the vertices move without telling anyone, so a temporal
+     upscaler reprojects them with motion vectors belonging to the undisplaced
+     surface — which is exactly the shimmering Crimson Desert shipped with.
+   ============================================================ */
+const G_FS = `#version 300 es
+precision highp float;
+in vec3 vWorld;
+out vec4 frag;
+void main(){ frag = vec4(vWorld, 1.0); }`;
+
+const SSD_VS = `#version 300 es
+precision highp float;
+// uGeom crosses the stage boundary, and int defaults to highp in a vertex
+// shader but mediump in a fragment one — which links as a precision conflict
+precision highp int;
+uniform sampler2D uAlb;                    // RGB albedo, A height
+uniform sampler2D uPos;                    // hull G-buffer: xyz world, w coverage
+uniform mat4  uProj, uView;
+uniform float uH, uTile;
+uniform int   uGeom, uCell;
+uniform ivec2 uGBSize, uCells;
+out vec3 vHit;
+out vec2 vUv;
+
+${COMMON_GEO}
+
+const ivec2 CORN[6] = ivec2[6](ivec2(0,0), ivec2(1,0), ivec2(1,1),
+                               ivec2(0,0), ivec2(1,1), ivec2(0,1));
+
+void main(){
+  int   cell = gl_VertexID / 6;
+  ivec2 c    = ivec2(cell % uCells.x, cell / uCells.x);
+
+  /* All four nodes of the cell are fetched by every one of its six vertices.
+     Per-vertex validity is not enough: a triangle with one corner on the
+     background and two on the hull still rasterizes, and interpolating a
+     "skip me" flag across it leaves most of its pixels looking valid. Deciding
+     per cell instead lets all six vertices agree and collapse together. */
+  vec4 g4[4];
+  vec2 uv4[4];
+  bool ok = true;
+  for (int i = 0; i < 4; i++){
+    ivec2 n = c + ivec2(i & 1, i >> 1);
+    g4[i]  = texelFetch(uPos, min(n * uCell, uGBSize - 1), 0);
+    uv4[i] = uvOf(g4[i].xyz);
+    ok = ok && g4[i].w > 0.5;
+  }
+  // the tower's atan seam jumps a full repeat between neighbouring nodes, and a
+  // cell straddling it would smear the entire texture across its own width
+  float umin = min(min(uv4[0].x, uv4[1].x), min(uv4[2].x, uv4[3].x));
+  float umax = max(max(uv4[0].x, uv4[1].x), max(uv4[2].x, uv4[3].x));
+
+  if (!ok || umax - umin > tiles().x * 0.5){
+    // z beyond the far plane: all six vertices land on the same clipped point,
+    // so the cell is rejected whole rather than drawn degenerate
+    gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+    vHit = vec3(0.0); vUv = vec2(0.0);
+    return;
+  }
+
+  ivec2 co = CORN[gl_VertexID - cell * 6];
+  int   ci = co.x + co.y * 2;
+  vec3  P  = g4[ci].xyz;
+  vec2  uv = uv4[ci];
+
+  vec3 T, B, N; frameAt(P, T, B, N);
+  vec3 Pd = P - N * (1.0 - heightAt(uv)) * uH;   // recede inward, as everywhere
+
+  vHit = Pd; vUv = uv;
+  gl_Position = uProj * uView * vec4(Pd, 1.0);
+}`;
+
+const SSD_FS = `#version 300 es
+precision highp float;
+precision highp int;
+in vec3 vHit;
+in vec2 vUv;
+uniform sampler2D uAlb, uNrm;
+uniform vec3  uCam, uLight;
+uniform float uH, uSplit, uTile;
+uniform int   uGeom, uModeA, uModeB;
+uniform bool  uCompare, uShadow, uHeat;
+out vec4 frag;
+
+${COMMON_GEO}
+${COMMON_SHADE}
+
+void main(){
+  int mode = (uCompare && gl_FragCoord.x > uSplit) ? uModeB : uModeA;
+  if (mode != 6) discard;
+
+  // Flat on purpose. Every other mode's heat is "how many samples did this
+  // pixel's ray need"; SSD's answer is one, everywhere, forever — its cost
+  // moved to the vertex stage and off the height map entirely.
+  if (uHeat){ frag = vec4(heat(1.0 / 32.0), 1.0); return; }
+
+  frag = vec4(shadeSurface(vHit, vUv, uShadow), 1.0);
 }`;
 
 const BG_VS = `#version 300 es
@@ -880,11 +1065,70 @@ function compile(vsSrc, fsSrc) {
 }
 
 const prog = compile(VS, FS), bgProg = compile(BG_VS, BG_FS);
-const U = {};
-for (const n of ["uProj","uView","uCam","uLight","uAlb","uNrm","uH","uSplit","uTile",
-                 "uIndep","uSteps","uModeA","uModeB","uGeom","uCompare","uShadow","uHeat"]) {
-  U[n] = gl.getUniformLocation(prog, n);
+const uniforms = (p, names) => {
+  const o = {};
+  for (const n of names) o[n] = gl.getUniformLocation(p, n);
+  return o;
+};
+const U = uniforms(prog,
+  ["uProj","uView","uCam","uLight","uAlb","uNrm","uH","uSplit","uTile",
+   "uIndep","uSteps","uModeA","uModeB","uGeom","uCompare","uShadow","uHeat"]);
+
+/* ---- screen-space displacement plumbing --------------------------------
+   The G-buffer stores world positions, so it needs a float-renderable target.
+   RGBA16F is the fallback: half floats resolve to about 2 mm at this scene's
+   scale, which is ~1.5% of the default depth — visible as faint quantisation
+   in the relief, but the technique still reads correctly. Neither available
+   means mode 6 is withheld from the dropdowns rather than shipped broken. */
+const GBUF_FMT =
+  gl.getExtension("EXT_color_buffer_float")      ? gl.RGBA32F :
+  gl.getExtension("EXT_color_buffer_half_float") ? gl.RGBA16F : 0;
+const SSD_OK = GBUF_FMT !== 0;
+
+let gProg = null, ssdProg = null, GU = null, DU = null;
+if (SSD_OK) {
+  gProg   = compile(VS, G_FS);
+  ssdProg = compile(SSD_VS, SSD_FS);
+  GU = uniforms(gProg, ["uProj","uView"]);
+  DU = uniforms(ssdProg,
+    ["uProj","uView","uCam","uLight","uAlb","uNrm","uPos","uH","uSplit","uTile",
+     "uGeom","uCell","uGBSize","uCells","uModeA","uModeB","uCompare","uShadow","uHeat"]);
 }
+
+let gbuf = null;
+function ensureGbuf(w, h) {
+  if (gbuf && gbuf.w === w && gbuf.h === h) return gbuf;
+  if (gbuf) { gl.deleteFramebuffer(gbuf.fb); gl.deleteTexture(gbuf.tex); }
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, GBUF_FMT, w, h, 0, gl.RGBA,
+                GBUF_FMT === gl.RGBA32F ? gl.FLOAT : gl.HALF_FLOAT, null);
+  // texelFetch only, so no filtering is needed — and float filtering is a
+  // separate extension that is not worth depending on for this
+  for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.NEAREST], [gl.TEXTURE_MAG_FILTER, gl.NEAREST],
+                        [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]])
+    gl.texParameteri(gl.TEXTURE_2D, k, v);
+  const fb = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  // no depth attachment: both hulls are convex and back-face culled, so the
+  // near surface is the only one rasterized
+  return (gbuf = { fb, tex, w, h });
+}
+
+/* One grid vertex per uCell device pixels. At 1:1 on a hidpi display this is
+   tens of millions of vertex invocations per frame, which is genuinely what
+   the technique costs — but a browser tab that stalls for a second teaches
+   nothing, so the cap coarsens the grid and the HUD reports what it actually
+   used rather than what was asked for. */
+const MAX_CELLS = 1.0e6;
+function gridFor(w, h, want) {
+  let cell = want;
+  while (Math.ceil(w / cell) * Math.ceil(h / cell) > MAX_CELLS) cell++;
+  return { cell, cols: Math.ceil(w / cell), rows: Math.ceil(h / cell) };
+}
+let lastGrid = null;
 
 function mkVao(data) {
   const vao = gl.createVertexArray();
@@ -917,21 +1161,25 @@ const MODES = [
   "Steep parallax mapping",
   "Parallax occlusion mapping",
   "Silhouette POM (SilPOM)",
+  "Screen-space displacement",
 ];
+const SSD = 6;
 const S = {
   geom: 1, mat: "scan", modeA: 4, modeB: 5, compare: true, split: 0.5,
-  depth: 0.13, steps: 24, tile: 1, indep: 0.75,
+  depth: 0.13, steps: 24, tile: 1, indep: 0.75, grid: 2,
   shadow: true, heat: false, sweep: true,
   la: 0.9, le: 0.40,
   yaw: 0.55, pitch: 0.10, dist: 3.6,
 };
+const usesSSD = () => S.modeA === SSD || (S.compare && S.modeB === SSD);
 
 const $ = (id) => document.getElementById(id);
-for (const sel of [$("modeA"), $("modeB")]) MODES.forEach((m, i) => sel.add(new Option(m, String(i))));
+for (const sel of [$("modeA"), $("modeB")])
+  MODES.forEach((m, i) => { if (i !== SSD || SSD_OK) sel.add(new Option(m, String(i))); });
 $("modeA").value = S.modeA; $("modeB").value = S.modeB;
 $("compare").checked = S.compare;
 $("depth").value = S.depth; $("steps").value = S.steps; $("tile").value = S.tile;
-$("indep").value = S.indep;
+$("indep").value = S.indep; $("grid").value = S.grid;
 $("shadow").checked = S.shadow; $("heat").checked = S.heat; $("sweep").checked = S.sweep;
 $("la").value = S.la; $("le").value = S.le;
 
@@ -951,14 +1199,18 @@ function syncUI() {
   $("oSteps").textContent = S.steps;
   $("oIndep").textContent = S.indep.toFixed(2);
   $("oTile").textContent  = S.tile + "×";
+  $("oGrid").textContent  = S.grid + " px";
   $("oLa").textContent = (S.la * 57.3).toFixed(0) + "°";
   $("oLe").textContent = (S.le * 57.3).toFixed(0) + "°";
 
-  const marching = S.modeA >= 3 || (S.compare && S.modeB >= 3);
-  $("steps").disabled = !marching;
-  $("indep").disabled = !marching;
-  $("rowSteps").classList.toggle("off", !marching);
-  $("rowIndep").classList.toggle("off", !marching);
+  // SSD marches nothing, so the sample budget is meaningless to it
+  const inRange = (m) => m >= 3 && m <= 5;
+  const marching = inRange(S.modeA) || (S.compare && inRange(S.modeB));
+  const ssd = usesSSD();
+  for (const [id, on] of [["steps", marching], ["indep", marching], ["grid", ssd]]) {
+    $(id).disabled = !on;
+    $("row" + id[0].toUpperCase() + id.slice(1)).classList.toggle("off", !on);
+  }
   for (const b of document.querySelectorAll("#geom button"))
     b.classList.toggle("on", +b.dataset.g === S.geom);
   for (const b of document.querySelectorAll("#mats button"))
@@ -976,10 +1228,10 @@ function syncUI() {
           : "Decoding scan…";
 
   // a flat quad has no outline to carve — say so instead of quietly doing nothing
-  const wantsSilo = S.modeA === 5 || (S.compare && S.modeB === 5);
+  const wantsSilo = [S.modeA, S.compare ? S.modeB : -1].some(m => m === 5 || m === SSD);
   const w = $("warn");
   w.style.display = (wantsSilo && S.geom === 0) ? "block" : "none";
-  w.textContent = "Silhouette POM on a flat wall only erodes the quad border — "
+  w.textContent = "On a flat wall a silhouette technique only erodes the quad border — "
                 + "switch to Tower to see the outline actually break.";
 }
 
@@ -993,6 +1245,7 @@ $("depth").oninput  = e => { S.depth = +e.target.value; syncUI(); };
 $("steps").oninput  = e => { S.steps = +e.target.value; syncUI(); };
 $("indep").oninput  = e => { S.indep = +e.target.value; syncUI(); };
 $("tile").oninput   = e => { S.tile = +e.target.value; syncUI(); };
+$("grid").oninput   = e => { S.grid = +e.target.value; syncUI(); };
 $("shadow").oninput = e => { S.shadow = e.target.checked; };
 $("heat").oninput   = e => { S.heat = e.target.checked; };
 $("sweep").oninput  = e => { S.sweep = e.target.checked; };
@@ -1106,6 +1359,19 @@ function frame(now) {
 }
 
 function drawScene() {
+  const cp = Math.cos(S.pitch);
+  const cam = [Math.sin(S.yaw) * cp * S.dist, Math.sin(S.pitch) * S.dist, Math.cos(S.yaw) * cp * S.dist];
+  const light = [
+    Math.cos(S.le) * Math.sin(S.la) * 5.0,
+    Math.sin(S.le) * 5.0,
+    Math.cos(S.le) * Math.cos(S.la) * 5.0,
+  ];
+  lastCam = cam;
+  const proj = perspective(0.82, canvas.width / canvas.height, 0.05, 40);
+  const view = lookAt(cam, [0, 0, 0], [0, 1, 0]);
+  const m = MESH[S.geom];
+  const ssd = usesSSD() && SSD_OK;
+
   gl.viewport(0, 0, canvas.width, canvas.height);
 
   gl.disable(gl.DEPTH_TEST); gl.depthMask(false); gl.disable(gl.CULL_FACE);
@@ -1117,19 +1383,27 @@ function drawScene() {
   // the tower is a closed hull, so cull its far side; the wall is single-sided
   if (S.geom) { gl.enable(gl.CULL_FACE); gl.cullFace(gl.BACK); gl.frontFace(gl.CCW); }
 
-  const cp = Math.cos(S.pitch);
-  const cam = [Math.sin(S.yaw) * cp * S.dist, Math.sin(S.pitch) * S.dist, Math.cos(S.yaw) * cp * S.dist];
-  const light = [
-    Math.cos(S.le) * Math.sin(S.la) * 5.0,
-    Math.sin(S.le) * 5.0,
-    Math.cos(S.le) * Math.cos(S.la) * 5.0,
-  ];
-  lastCam = cam;
+  // pass 1 of screen-space displacement: the hull's world position per pixel.
+  // Skipped entirely unless mode 6 is on screen, so it costs nothing otherwise.
+  if (ssd) {
+    const g = ensureGbuf(canvas.width, canvas.height);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, g.fb);
+    gl.viewport(0, 0, g.w, g.h);
+    gl.depthMask(false); gl.disable(gl.DEPTH_TEST);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.useProgram(gProg); gl.bindVertexArray(m.vao);
+    gl.uniformMatrix4fv(GU.uProj, false, proj);
+    gl.uniformMatrix4fv(GU.uView, false, view);
+    gl.drawArrays(gl.TRIANGLES, 0, m.count);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.enable(gl.DEPTH_TEST); gl.depthMask(true);
+  }
 
-  const m = MESH[S.geom];
   gl.useProgram(prog); gl.bindVertexArray(m.vao);
-  gl.uniformMatrix4fv(U.uProj, false, perspective(0.82, canvas.width / canvas.height, 0.05, 40));
-  gl.uniformMatrix4fv(U.uView, false, lookAt(cam, [0, 0, 0], [0, 1, 0]));
+  gl.uniformMatrix4fv(U.uProj, false, proj);
+  gl.uniformMatrix4fv(U.uView, false, view);
   gl.uniform3fv(U.uCam, cam);
   gl.uniform3fv(U.uLight, light);
   gl.uniform1f(U.uH, S.depth);
@@ -1147,6 +1421,40 @@ function drawScene() {
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, mat.albedo); gl.uniform1i(U.uAlb, 0);
   gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, mat.normal); gl.uniform1i(U.uNrm, 1);
   gl.drawArrays(gl.TRIANGLES, 0, m.count);
+
+  if (!ssd) { lastGrid = null; return; }
+
+  /* pass 2: the screen grid. It covers the whole viewport because that is what
+     the technique does — the fragment shader throws away the half that belongs
+     to the other mode, but the vertex work is paid regardless. Real engines
+     bound it to the objects that opted in; the honest read of the numbers here
+     is that a split-screen comparison charges SSD for the full screen. */
+  const grid = gridFor(canvas.width, canvas.height, S.grid);
+  lastGrid = grid;
+  gl.useProgram(ssdProg); gl.bindVertexArray(bgVao);
+  // a displaced grid flips winding wherever the height field is steep, so
+  // culling here would punch holes in exactly the interesting places
+  gl.disable(gl.CULL_FACE);
+  gl.uniformMatrix4fv(DU.uProj, false, proj);
+  gl.uniformMatrix4fv(DU.uView, false, view);
+  gl.uniform3fv(DU.uCam, cam);
+  gl.uniform3fv(DU.uLight, light);
+  gl.uniform1f(DU.uH, S.depth);
+  gl.uniform1f(DU.uSplit, S.split * canvas.width);
+  gl.uniform1f(DU.uTile, S.tile);
+  gl.uniform1i(DU.uGeom, S.geom);
+  gl.uniform1i(DU.uCell, grid.cell);
+  gl.uniform2i(DU.uGBSize, gbuf.w, gbuf.h);
+  gl.uniform2i(DU.uCells, grid.cols, grid.rows);
+  gl.uniform1i(DU.uModeA, S.modeA);
+  gl.uniform1i(DU.uModeB, S.modeB);
+  gl.uniform1i(DU.uCompare, S.compare ? 1 : 0);
+  gl.uniform1i(DU.uShadow, S.shadow ? 1 : 0);
+  gl.uniform1i(DU.uHeat, S.heat ? 1 : 0);
+  gl.uniform1i(DU.uAlb, 0);
+  gl.uniform1i(DU.uNrm, 1);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, gbuf.tex); gl.uniform1i(DU.uPos, 2);
+  gl.drawArrays(gl.TRIANGLES, 0, grid.cols * grid.rows * 6);
 }
 
 /* Shader-cost probe, console only: benchAll([{mode,steps,geom,shadow}, ...]).
@@ -1194,8 +1502,13 @@ window.benchAll = (cfgs, { reps = 20, passes = 5, w = 1280, h = 720 } = {}) => {
 function updateHud() {
   const l = Math.hypot(lastCam[0], lastCam[1], lastCam[2]) || 1;
   const graze = Math.acos(Math.min(1, Math.abs(lastCam[2]) / l)) * 57.2958;
+  // the triangle count is the point of SSD, so show what the grid actually
+  // cost — including the cell size the cap forced, which may not be the slider
+  const g = lastGrid;
   hud.innerHTML = `<b>${fps.toFixed(0)}</b> fps` +
     (S.geom ? "" : ` &nbsp;·&nbsp; view <b>${graze.toFixed(0)}°</b> off-normal`) +
+    (g ? ` &nbsp;·&nbsp; grid <b>${g.cols}×${g.rows}</b> @ ${g.cell} px = ` +
+         `<b>${(g.cols * g.rows * 2 / 1e6).toFixed(1)}M</b> tris` : "") +
     `&nbsp;·&nbsp; drag = orbit, wheel = zoom`;
 }
 

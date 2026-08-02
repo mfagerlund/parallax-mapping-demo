@@ -52,20 +52,24 @@ All of the above share one hard limit: **they cannot change the outline.** The
 shape's silhouette is its polygon edge, so relief can only ever happen *inside*
 the shape. A cobbled cylinder stays a perfect cylinder in profile.
 
-Beating that requires either **real displaced geometry** — actually subdividing
-the mesh and moving vertices, which is what tessellation does — or a per-pixel
-trick that discards fragments where the ray escapes the surface entirely, which
-is what this demo calls **silhouette POM**.
+Beating that requires one of three things: **real displaced geometry** — actually
+subdividing the mesh and moving vertices, which is what tessellation does — or a
+per-pixel trick that discards fragments where the ray escapes the surface
+entirely, which is what this demo calls **silhouette POM** — or **screen-space
+displacement**, which builds real geometry but takes its subdivision from the
+framebuffer instead of the mesh.
 
 Quality settings in shipping games routinely swap between these tiers, which is
 why a "model quality" slider can change how a wall's edge looks, not just its
 texture. Crimson Desert is one public example: it drops tessellation at Low and
-[substitutes parallax](https://steamcommunity.com/app/3321460/discussions/0/805721252880897880/).
-It runs on Pearl Abyss's proprietary
+[substitutes parallax](https://steamcommunity.com/app/3321460/discussions/0/805721252880897880/),
+and it also ships a *Screen Space Displacement* setting of its own. It runs on
+Pearl Abyss's proprietary
 [BlackSpace Engine](https://80.lv/articles/pearl-abyss-demonstrated-crimson-desert-s-blackspace-engine-tech-advancements),
-and nothing here is a claim about its internals.
+and nothing here is a claim about its internals — mode 6 below is this repo's
+reading of a public technique, not a reconstruction of theirs.
 
-## The six modes
+## The seven modes
 
 | # | Mode | What it shows |
 |---|---|---|
@@ -75,6 +79,7 @@ and nothing here is a claim about its internals.
 | 3 | Steep parallax | Ray march without interpolation. Visible terracing. |
 | 4 | Parallax occlusion mapping | Same march, interpolated. The usual production choice. |
 | 5 | Silhouette POM | Marches in object space, so rays can miss entirely and cut the outline. |
+| 6 | Screen-space displacement | Displaces a screen-resolution grid. Real geometry, real depth, screen-space failures. |
 
 ### Normal mapping vs. POM
 
@@ -104,6 +109,81 @@ At 10 samples the un-interpolated march quantises the surface into visible
 terraces. Interpolating between the last two samples removes them for
 approximately no cost.
 
+## Screen-space displacement
+
+Mode 6 is the odd one out, and the only member of the family that is not a
+relief shader at all. Two passes:
+
+1. Rasterize the undisplaced hull into a G-buffer holding its world position.
+   A deferred renderer already has this.
+2. Draw a grid of triangles **one cell per screen pixel**. Each grid node reads
+   the hull position under it, pushes it along the surface normal by the height
+   map, and projects the result.
+
+So it really is displaced geometry — it just takes its subdivision from the
+framebuffer instead of the mesh. That is the whole "infinite detail without the
+memory cost" claim: there is no subdivided mesh to author, store or stream, and
+picking a tessellation rate — the hard part of tessellation, which screen-space
+tessellation heuristics exist to approximate — comes out exactly right by
+construction, everywhere, for free.
+
+Three things follow that no other mode here gets:
+
+- **Correct depth.** The rasterizer wrote it. Mode 5 fakes its outline with
+  `discard` and leaves the *undisplaced hull's* depth in the buffer — silently
+  wrong, and wrong for every consumer downstream. This just does not have that
+  problem, which deletes most of the objection list further down this file.
+- **Cost decoupled from content.** Every pixel does exactly one displacement.
+  Turn on the heatmap and mode 6 reads uniformly flat while POM shows red
+  streaks down every joint. POM's cost also scales with the Depth slider and
+  with how flat the view is; this is indifferent to both.
+- **It generalises.** Mode 5 is exact only because a cylinder and a slab have
+  closed-form ray intersections. Mode 6 needs nothing but position, normal and
+  height per pixel — any mesh, skinned characters, decals.
+
+### Where it fails, and why it is all one reason
+
+The grid is a height field over the camera's view: **single-layered, and it
+stops at the viewport.**
+
+- **Corners, limbs and anything at a grazing angle.** Where the true displaced
+  surface should *tear open* — one piece of surface swinging in front of
+  another, revealing what was behind it — a single sheet can only **stretch**.
+  Push Depth to maximum on the tower and the fan-shaped smears radiating off
+  every stone edge are exactly this. At a convex corner the two faces displace
+  in different directions and the cells spanning them smear across the gap.
+- **The screen edge.** Border nodes have no neighbours off-screen to pull
+  surface in from. Worse, it swims as the camera pans, because which cells
+  qualify keeps changing.
+- **Shadow maps.** "Screen space" means *camera* space. The displaced surface
+  does not exist in the light's projection, so casting from it needs a second
+  G-buffer and grid per cascade.
+- **Temporal upscaling.** The vertices move without telling anyone downstream,
+  so DLSS/TAA reprojects them using motion vectors belonging to the undisplaced
+  surface. This is the shimmer Crimson Desert
+  [shipped with](https://www.nexusmods.com/crimsondesert/mods/3080) and
+  [patched later](https://crimsondeserthq.com/blog/crimson-desert-dlss-fsr-upscaling-changes-patch-1-01-00).
+  This demo has no TAA, so it is the one failure you cannot see here.
+
+The first two are inherent. Two artifacts you *will* see are this
+implementation's, not the technique's: any grid cell with a node off the hull is
+dropped whole, which erodes the outline by one cell; and a cap of ~1M cells
+quietly coarsens the grid on large canvases. The HUD reports the cell size
+actually used, which is not always the one the slider shows.
+
+### Which is the better silhouette technique?
+
+Mode 6 wins on nearly every axis that matters in an engine — real depth,
+predictable cost, no `discard` so early-Z survives, works on arbitrary meshes.
+Mode 5's advantages are that it needs no extra pass, no G-buffer and no
+float-renderable target, and that it degrades in ways that stay local to the
+pixel rather than smearing across a neighbourhood.
+
+The honest summary is that they fail in opposite places. Mode 5 fakes geometry
+and gets a convincing outline with wrong depth. Mode 6 makes real geometry with
+right depth, and gets a convincing outline everywhere its single-layer input was
+sufficient — which is most of a surface, and not its edges.
+
 ## What it costs
 
 Measured on an Intel Iris Xe integrated GPU at 960×540, with the object filling
@@ -123,6 +203,19 @@ scales linearly. **Silhouette POM costs roughly 3× POM on a cylinder**, because
 rays near the outline cross a long slice of the surface instead of plunging
 straight through it. The flat-wall multiplier in that table is the least
 trustworthy number in it — see the cross-check below.
+
+**Screen-space displacement is deliberately absent from that table, because it
+has not been measured.** It does not belong in it anyway: every other row is
+parameterised by sample count, and mode 6 does not have one — its cost is set by
+grid cell size and screen resolution, and is flat with respect to depth, view
+angle and height-map content. A first attempt on the reference laptop produced
+numbers that failed their own sanity check (quartering the cell count moved the
+time by 1.45×, and one configuration measured *faster* than plain normal
+mapping), which is `benchAll` reporting the wrong thing rather than a result —
+the same failure mode documented at the bottom of this file. Anything trustworthy
+here needs `EXT_disjoint_timer_query_webgl2` on hardware that is not also running
+the browser. Until then the HUD's live triangle count is the honest number: it is
+what the technique actually asks of the GPU.
 
 ### Cross-checked on an RTX 4090
 
@@ -151,10 +244,15 @@ deep joints, and the lee side of every stone edge. Cost is wildly non-uniform, i
 follows the height map rather than the screen, and it worsens as the view
 flattens.
 
+Mode 6 is the exception that proves the point: it reads uniformly flat, because
+its cost never touches the height map at all.
+
 ### The costs this table does not include
 
 If you are deciding whether to use silhouette relief in a real engine, these
-usually matter more than the numbers above, and this demo pays none of them:
+usually matter more than the numbers above, and this demo pays none of them.
+They apply to **mode 5**; mode 6 escapes the first two outright and hits the
+third differently, as described above:
 
 - **Discarding fragments disables early depth rejection** for the whole draw
   call, often costing more than the ray march itself.
@@ -181,19 +279,59 @@ Together these are much of the answer to *why do engines tessellate instead.*
 - **Ground** — use POM. Ground is flat, so there is no outline to break. What
   ground stresses is shallow viewing angles, where sample counts explode.
 
+### If you are considering SSD for decals
+
+This is the strongest case for it, because of where decals already sit in a
+deferred pipeline. A decal is a G-buffer blend; give the G-buffer a height
+channel and decals write into it like any other. The displacement pass then runs
+**once**, so *n* overlapping decals cost *n* cheap blends and one pass — where
+geometry decals cost *n* meshes and POM decals cost *n* marches.
+
+The rule that falls out of the single-layer limit: **recessed detail in the
+interior of a face, yes; protruding detail on an edge, no.**
+
+- **Window reveals, wall damage, cracks, mortar erosion, cobbles, kerbs** —
+  good. Author the reveal with a chamfer rather than a cliff, or the cells
+  spanning the frame stretch into a smear instead of a jamb.
+- **Corner quoins** — no. They protrude, so there are no hull pixels to displace
+  outward; and a building corner is precisely where two faces with 90°-apart
+  normals make the sheet smear. They are also trivial as instanced geometry.
+- **Roof ornaments** — no. Protruding, genuinely overhanging (a height field is
+  single-valued), skylined where nothing hides the artifact, and usually
+  sub-cell at distance.
+
+Two traps worth knowing before starting: height does not alpha-blend — each
+decal needs an explicit op (`max`, replace-within-mask, subtract) or borders turn
+to mush — and you only get displacement along the normal unless the decal also
+writes a direction.
+
+This section is reasoning from the structure of the pass, not from a decal
+system anyone has built on top of it.
+
 ## What this is not
 
-- **Not a new technique.** Everything here dates from 2004–2006 and is well
-  documented elsewhere. The demo exists to make the comparison concrete and the
-  costs measurable, not to propose anything.
-- **Not equivalent to tessellation.** Real displacement creates geometry: it
-  shadows correctly, writes correct depth, and survives every rendering pass.
-  Mode 5 fakes the outline by discarding pixels, and reaches a similar look
-  through a completely different mechanism with different failure modes.
-- **Not generalisable as written.** Mode 5's ray march is exact only because the
-  shapes here are a cylinder and a slab, which have closed-form intersections. It
-  does not extend to arbitrary meshes — published approaches approximate each
-  triangle with a curved patch instead.
+- **Not a new technique.** Modes 0–5 date from 2004–2006 and are well documented
+  elsewhere. Screen-space displacement is more recent and less settled, but it is
+  not this repo's invention either. The demo exists to make the comparison
+  concrete and the costs measurable, not to propose anything.
+- **Mode 5 is not equivalent to tessellation.** Real displacement creates
+  geometry: it shadows correctly, writes correct depth, and survives every
+  rendering pass. Mode 5 fakes the outline by discarding pixels, and reaches a
+  similar look through a completely different mechanism with different failure
+  modes. Mode 6 *is* real geometry and does write correct depth — but it still
+  does not survive every pass, because it does not exist outside the camera's
+  view.
+- **Mode 5 is not generalisable as written.** Its ray march is exact only because
+  the shapes here are a cylinder and a slab, which have closed-form
+  intersections. It does not extend to arbitrary meshes — published approaches
+  approximate each triangle with a curved patch instead. Mode 6 does not share
+  this limit; it takes the same shortcut here only for convenience, deriving UV
+  and normal from the analytic surface instead of storing them in the G-buffer
+  alongside position, as an engine would.
+- **Not a reconstruction of anyone's shipping renderer.** Mode 6 is this repo's
+  reading of a publicly described technique. Crimson Desert ships a setting by
+  that name and its artifacts are consistent with this family, which is as far as
+  the claim goes.
 
 ## Controls worth knowing
 
@@ -208,6 +346,12 @@ the same sample count. At 1 the count falls off for surfaces facing you directly
 so shallow-angle pixels — which travel furthest through the height map — keep the
 full budget. Consequence worth knowing: at the default of 0.75, a
 directly-facing surface gets only a quarter of the slider value.
+
+**SSD screen grid** is mode 6's only quality knob, and it is the tessellation
+rate: the grid cell size in device pixels. At 1 px the outline is exact and the
+grid is millions of triangles. It is capped at roughly a million cells, so on a
+large canvas the value used is coarser than the one requested — the HUD reports
+what was actually drawn, along with the triangle count.
 
 ## Licence and credits
 
@@ -237,6 +381,30 @@ standard relief-mapping convention, so the rasterized hull is a correct outer
 bound and no inflated shell is needed. A flat wall cannot grow a silhouette
 because the rasterizer emits no fragments beyond its polygon edge — relief can
 only bite inward.
+
+**The screen grid is drawn from `gl_VertexID` alone**, with no vertex buffer: six
+vertices per cell, positions fetched from the G-buffer. Two details are load
+bearing. All four nodes of a cell are fetched by every one of its six vertices,
+because per-vertex validity is not enough — a triangle with one corner on the
+background and two on the hull still rasterizes, and interpolating a "skip me"
+flag across it leaves most of its pixels looking valid. Deciding per cell lets
+all six vertices agree and collapse to the same clipped position. The same test
+also rejects cells straddling the cylinder's `atan` seam, which would otherwise
+smear a full texture repeat across one cell. Culling is disabled for the pass:
+displacement flips triangle winding wherever the height field is steep, which is
+exactly where the interesting pixels are.
+
+**The G-buffer needs a float-renderable target.** `RGBA32F` if
+`EXT_color_buffer_float` is present, `RGBA16F` if only the half-float variant is
+— half floats resolve to about 2 mm at this scene's scale, roughly 1.5% of the
+default depth, visible as faint quantisation but not misleading. With neither,
+mode 6 is withheld from the dropdowns rather than shipped broken. Only
+`texelFetch` reads it, so no float *filtering* extension is needed.
+
+**Precision qualifiers cross the stage boundary.** `int` defaults to `highp` in a
+vertex shader and `mediump` in a fragment one, so a shared `int` uniform fails to
+link until both stages declare `precision highp int`. This cost a confusing
+"Precisions of uniform 'uGeom' differ" the first time mode 6 compiled.
 
 **Height map precision.** Derived from the scan's 16-bit displacement,
 contrast-stretched across its 0.5–99.5 percentile range into 8 bits, a 1.78×
