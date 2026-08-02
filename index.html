@@ -144,14 +144,23 @@
 
   <div class="grp">
     <div class="ttl">Geometry</div>
-    <div class="seg c2" id="geom">
+    <div class="seg c3" id="geom">
       <button data-g="1">Tower</button>
+      <button data-g="2">Cube</button>
       <button data-g="0">Wall</button>
     </div>
     <p class="note" style="margin-top:8px">
       Only curved geometry gets a true silhouette. On a wall the relief can bite
       <em>inward</em> from the polygon border, but nothing can push past it —
       the rasterizer emits no fragments out there to shade.
+    </p>
+    <p class="note">
+      The <b>cube</b> is the corner case. Each face carries a whole number of
+      texture repeats, so every edge falls on a tile boundary and no stone is cut
+      through the middle at a corner — the pattern runs around all four vertical
+      edges unbroken. Then compare techniques <em>at</em> an edge: POM leaves it
+      a clean straight line, and screen-space displacement smears across it,
+      because two faces pointing 90° apart cannot be one sheet.
     </p>
   </div>
 
@@ -615,6 +624,31 @@ function towerMesh(seg) {
   return new Float32Array(v);
 }
 
+/* Cube, half-size 1. Faces are emitted from (normal, tangent, bitangent) triples
+   chosen so T x B == N, which makes the quad CCW from outside — same culling
+   convention as the tower — and, more importantly, makes the frame agree with
+   the tangent basis frameAt() reports for the same face. Get those two out of
+   step and the normal map lights one face of the cube inside out. */
+const CUBE_FACES = [
+  [[0,0, 1], [ 1,0, 0], [0,1, 0]],   // +Z
+  [[0,0,-1], [-1,0, 0], [0,1, 0]],   // -Z
+  [[ 1,0,0], [0,0,-1],  [0,1, 0]],   // +X
+  [[-1,0,0], [0,0, 1],  [0,1, 0]],   // -X
+  [[0, 1,0], [ 1,0,0],  [0,0,-1]],   // +Y
+  [[0,-1,0], [ 1,0,0],  [0,0, 1]],   // -Y
+];
+function cubeMesh() {
+  const v = [];
+  for (const [n, t, b] of CUBE_FACES) {
+    const c = (su, sv) => [n[0] + t[0]*su + b[0]*sv,
+                           n[1] + t[1]*su + b[1]*sv,
+                           n[2] + t[2]*su + b[2]*sv];
+    const p00 = c(-1,-1), p10 = c(1,-1), p11 = c(1,1), p01 = c(-1,1);
+    v.push(...p00, ...p10, ...p11,  ...p00, ...p11, ...p01);
+  }
+  return new Float32Array(v);
+}
+
 /* ============================================================
    Shaders
    ============================================================ */
@@ -638,26 +672,62 @@ const float TAU = 6.28318530718;
 const float R   = ${TOWER_R.toFixed(4)};
 const float TY  = ${TOWER_Y.toFixed(4)};
 
-// tower ratio 3:2 keeps texels square-ish: circumference 2*PI*R vs height 2*TY
-vec2 tiles(){ return uGeom == 0 ? vec2(uTile) : vec2(3.0 * uTile, 2.0 * uTile); }
+/* Wall and cube both span 2 world units per face, so one tile count serves
+   both; the tower's 3:2 ratio keeps texels square-ish, circumference 2*PI*R
+   against height 2*TY. Because a cube face spans exactly uTile repeats and
+   uTile is an integer, every cube edge lands on a tile boundary — nothing is
+   cut through the middle of a stone at a corner. */
+vec2 tiles(){ return uGeom == 1 ? vec2(3.0 * uTile, 2.0 * uTile) : vec2(uTile); }
 vec2 wpu(){
   vec2 t = tiles();
-  return uGeom == 0 ? vec2(2.0) / t : vec2(TAU * R, 2.0 * TY) / t;
+  return uGeom == 1 ? vec2(TAU * R, 2.0 * TY) / t : vec2(2.0) / t;
 }
+
+/* Which of the cube's six faces a point belongs to, as an axis-aligned outward
+   normal. Valid anywhere in the displaceable shell, not just on the surface,
+   because uH stays well under the half-size. */
+vec3 cubeFace(vec3 P){
+  vec3 a = abs(P);
+  if (a.x >= a.y && a.x >= a.z) return vec3(sign(P.x), 0.0, 0.0);
+  if (a.y >= a.z)               return vec3(0.0, sign(P.y), 0.0);
+  return vec3(0.0, 0.0, sign(P.z));
+}
+
+/* The cube's per-face charts are oriented so that u continues around all four
+   vertical edges by wrapping: leaving +Z at u = t re-enters +X at u = 0, and a
+   tiling texture makes those the same column. Eight of the twelve edges join
+   seamlessly this way. The remaining four — where a side face's u axis meets a
+   cap's v axis — cannot, on any cube: you cannot orient all six charts
+   consistently. Those four sit on the top and bottom, out of the default frame. */
 vec2 uvOf(vec3 P){
   vec2 t = tiles();
   if (uGeom == 0) return (P.xy * 0.5 + 0.5) * t;
-  return vec2(atan(P.z, P.x) / TAU + 0.5, (P.y + TY) / (2.0 * TY)) * t;
+  if (uGeom == 1) return vec2(atan(P.z, P.x) / TAU + 0.5, (P.y + TY) / (2.0 * TY)) * t;
+  vec3 n = cubeFace(P);
+  vec2 q = n.x != 0.0 ? vec2(-n.x * P.z, P.y)
+         : n.y != 0.0 ? vec2(P.x, -n.y * P.z)
+                      : vec2(n.z * P.x, P.y);
+  return (q * 0.5 + 0.5) * t;
 }
 float heightAt(vec2 uv){ return textureLod(uAlb, uv, 0.0).a; }
 
-/* ---- tangent frame at a point on the hull ------------------------------- */
+/* ---- tangent frame at a point on the hull -------------------------------
+   T is the direction uv.x increases, B the direction uv.y increases, and
+   T x B == N. Must stay in lockstep with uvOf above. */
 void frameAt(vec3 P, out vec3 T, out vec3 B, out vec3 N){
   if (uGeom == 0){ T = vec3(1,0,0); B = vec3(0,1,0); N = vec3(0,0,1); return; }
-  N = normalize(vec3(P.x, 0.0, P.z));
-  T = vec3(-N.z, 0.0, N.x);
-  B = vec3(0,1,0);
+  if (uGeom == 1){
+    N = normalize(vec3(P.x, 0.0, P.z));
+    T = vec3(-N.z, 0.0, N.x);
+    B = vec3(0,1,0);
+    return;
+  }
+  N = cubeFace(P);
+  if (N.x != 0.0)      { T = vec3(0.0, 0.0, -N.x); B = vec3(0,1,0); }
+  else if (N.y != 0.0) { T = vec3(1,0,0);          B = vec3(0.0, 0.0, -N.y); }
+  else                 { T = vec3(N.z, 0.0, 0.0);  B = vec3(0,1,0); }
 }
+vec3 normalAt(vec3 P){ vec3 T, B, N; frameAt(P, T, B, N); return N; }
 
 vec3 heat(float t){
   t = clamp(t, 0.0, 1.0);
@@ -725,13 +795,19 @@ ${COMMON_GEO}
 
 /* Signed INSIDE/OUTSIDE test, >0 outside the material. Deliberately not a true
    signed-distance field: it measures along one axis only (z for the wall, radius
-   for the tower), so its magnitude overstates the real distance on steep slopes.
+   for the tower, the dominant axis for the cube), so its magnitude overstates
+   the real distance on steep slopes.
    That is fine here because the caller only reads its sign and then interpolates
    between the last two samples — but do not feed it to a distance-based marcher
    expecting a conservative step bound, because it is not one. */
 float fieldAt(vec3 P){
-  if (uGeom == 0) return P.z + (1.0 - heightAt(uvOf(P))) * uH;
-  return length(P.xz) - (R - (1.0 - heightAt(uvOf(P))) * uH);
+  float d = (1.0 - heightAt(uvOf(P))) * uH;
+  if (uGeom == 0) return P.z + d;
+  if (uGeom == 1) return length(P.xz) - (R - d);
+  // Chebyshev norm is to a box what length() is to a cylinder: the level set
+  // max(|x|,|y|,|z|) = 1 is exactly the cube's surface
+  vec3 a = abs(P);
+  return max(a.x, max(a.y, a.z)) - (1.0 - d);
 }
 
 /* ---- ray vs. the undisplaced hull ---------------------------------------
@@ -753,6 +829,28 @@ bool hitHull(vec3 O, vec3 D, out float t0, out float t1, out bool solid){
     if (t1 <= t0) { t1 = t0; return true; }
     solid = true;
     return true;
+  }
+  if (uGeom == 2){
+    // slab method against nested boxes. Components of D at exactly zero would
+    // make the 0 * inf below a NaN, so nudge them; at 1e-6 the resulting slab
+    // bounds are +-1e6 and simply never constrain, which is the right answer.
+    vec3 Dn = mix(D, vec3(1e-6), lessThan(abs(D), vec3(1e-6)));
+    vec3 iv = 1.0 / Dn;
+    vec3 pa = (vec3(-1.0) - O) * iv, pb = (vec3(1.0) - O) * iv;
+    vec3 lo = min(pa, pb), hi = max(pa, pb);
+    float tn = max(lo.x, max(lo.y, lo.z));
+    float tf = min(hi.x, min(hi.y, hi.z));
+    if (tf <= 0.0 || tn >= tf) return false;
+    t0 = max(tn, 0.0);
+    t1 = tf;
+    // near hit on the inner box: past it the ray is inside the material
+    float ri = 1.0 - uH;
+    vec3 qa = (vec3(-ri) - O) * iv, qb = (vec3(ri) - O) * iv;
+    vec3 lo2 = min(qa, qb), hi2 = max(qa, qb);
+    float tn2 = max(lo2.x, max(lo2.y, lo2.z));
+    float tf2 = min(hi2.x, min(hi2.y, hi2.z));
+    if (tf2 > tn2 && tn2 > t0 && tn2 < t1){ t1 = tn2; solid = true; }
+    return t1 > t0;
   }
   float a = dot(D.xz, D.xz);
   float b = 2.0 * dot(O.xz, D.xz);
@@ -818,7 +916,7 @@ vec2 marchTangent(vec2 uv0, vec3 V, vec2 sc, bool interp, out float iters){
 #define MAXI 768
 bool marchObject(vec3 O, vec3 D, float t0, float t1, bool solid, out vec3 hitP, out float iters){
   vec3 P0 = O + D * t0;
-  vec3 N0 = uGeom == 0 ? vec3(0,0,1) : normalize(vec3(P0.x, 0.0, P0.z));
+  vec3 N0 = normalAt(P0);
   // the floor only binds on near-tangent rays, which really do cross a long
   // chord of the shell; everywhere else the slider sets the step size outright
   float budget = stepsFor(dot(-D, N0));
@@ -974,12 +1072,22 @@ void main(){
     uv4[i] = uvOf(g4[i].xyz);
     ok = ok && g4[i].w > 0.5;
   }
-  // the tower's atan seam jumps a full repeat between neighbouring nodes, and a
-  // cell straddling it would smear the entire texture across its own width
-  float umin = min(min(uv4[0].x, uv4[1].x), min(uv4[2].x, uv4[3].x));
-  float umax = max(max(uv4[0].x, uv4[1].x), max(uv4[2].x, uv4[3].x));
+  /* Charts wrap. The tower's atan seam jumps a full circumference between
+     neighbouring nodes, and a cube's four vertical edges jump a full face, even
+     though a tiling texture makes both sides of those joins the same column.
+     Interpolating the raw numbers would sweep the whole texture across one cell,
+     so re-express every node on the first node's branch: same texels, no jump.
+     This is what keeps the cube's corners continuous rather than gapped. */
+  vec2 t = tiles();
+  for (int i = 1; i < 4; i++) uv4[i] -= t * round((uv4[i] - uv4[0]) / t);
 
-  if (!ok || umax - umin > tiles().x * 0.5){
+  // Four of a cube's twelve edges are genuinely discontinuous — no orientation
+  // of six charts can avoid it — and unwrapping cannot rescue those. They sit on
+  // the caps, out of the default frame. Drop cells that still straddle a jump.
+  vec2 lo = min(min(uv4[0], uv4[1]), min(uv4[2], uv4[3]));
+  vec2 hi = max(max(uv4[0], uv4[1]), max(uv4[2], uv4[3]));
+
+  if (!ok || any(greaterThan(hi - lo, t * 0.5))){
     // z beyond the far plane: all six vertices land on the same clipped point,
     // so the cell is rejected whole rather than drawn degenerate
     gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
@@ -1141,7 +1249,9 @@ function mkVao(data) {
   gl.bindVertexArray(null);
   return { vao, count: data.length / 3 };
 }
-const MESH = [mkVao(wallMesh()), mkVao(towerMesh(96))];
+// index == S.geom == the shader's uGeom
+const MESH = [mkVao(wallMesh()), mkVao(towerMesh(96)), mkVao(cubeMesh())];
+const FRAMING = [2.9, 3.6, 3.6];        // orbit distance that fills the frame
 const bgVao = gl.createVertexArray();
 
 // generating a material costs JS time, so only build one when it is asked for
@@ -1258,7 +1368,7 @@ for (const b of document.querySelectorAll("#mats button")) {
 
 for (const b of document.querySelectorAll("#geom button")) {
   b.onclick = () => {
-    S.geom = +b.dataset.g; S.dist = S.geom ? 3.6 : 2.9;
+    S.geom = +b.dataset.g; S.dist = FRAMING[S.geom];
     S.pitch = clampPitch(S.pitch); syncUI();
   };
 }
@@ -1283,7 +1393,7 @@ for (const b of document.querySelectorAll(".btns button")) {
   b.onclick = () => {
     S.modeA = +b.dataset.a; S.modeB = +b.dataset.b; S.compare = true;
     if (b.dataset.g !== undefined) {
-      S.geom = +b.dataset.g; S.dist = S.geom ? 3.6 : 2.9; S.pitch = clampPitch(S.pitch);
+      S.geom = +b.dataset.g; S.dist = FRAMING[S.geom]; S.pitch = clampPitch(S.pitch);
     }
     $("modeA").value = S.modeA; $("modeB").value = S.modeB; $("compare").checked = true;
     // steep parallax only shows its banding when the layers are coarse
@@ -1293,9 +1403,11 @@ for (const b of document.querySelectorAll(".btns button")) {
 }
 
 /* ---- camera ---- */
-// the tower is an open tube with no end caps, so keep the eye near its equator
+// the tower is an open tube with no end caps, so keep the eye near its equator.
+// the cube is closed and can be looked down on, though its four discontinuous
+// chart edges are up there, so stop short of straight overhead.
 const clampPitch = (p) => {
-  const lim = S.geom ? 0.42 : 1.30;
+  const lim = [1.30, 0.42, 0.95][S.geom];
   return Math.max(-lim, Math.min(lim, p));
 };
 let dragging = false, px = 0, py = 0;

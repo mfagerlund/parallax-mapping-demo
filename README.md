@@ -30,6 +30,10 @@ network, no install.
   to move the split.
 - **Compare presets** are shortcuts that set both dropdowns to a pairing that
   demonstrates something specific.
+- **Geometry** picks what the material is wrapped around. The *wall* has no
+  outline to break, the *tower* is the classic curved silhouette, and the *cube*
+  is the corner case — the one that separates techniques that fake an outline
+  from techniques that fake a surface.
 
 ## The short version of the problem
 
@@ -150,8 +154,12 @@ stops at the viewport.**
   surface should *tear open* — one piece of surface swinging in front of
   another, revealing what was behind it — a single sheet can only **stretch**.
   Push Depth to maximum on the tower and the fan-shaped smears radiating off
-  every stone edge are exactly this. At a convex corner the two faces displace
-  in different directions and the cells spanning them smear across the gap.
+  every stone edge are exactly this. The **Cube** geometry isolates it: at a
+  vertical edge the two faces displace 90° apart, and the cells spanning them
+  stretch into a vertical band whose width is the displacement depth in screen
+  pixels — obvious at any depth, and it does not shrink as the grid gets finer,
+  because it is not a resolution problem. Switch that same corner to POM and it
+  is a clean straight line.
 - **The screen edge.** Border nodes have no neighbours off-screen to pull
   surface in from. Worse, it swims as the camera pans, because which cells
   qualify keeps changing.
@@ -295,7 +303,9 @@ interior of a face, yes; protruding detail on an edge, no.**
   spanning the frame stretch into a smear instead of a jamb.
 - **Corner quoins** — no. They protrude, so there are no hull pixels to displace
   outward; and a building corner is precisely where two faces with 90°-apart
-  normals make the sheet smear. They are also trivial as instanced geometry.
+  normals make the sheet smear. Load the **Cube** and look at a vertical edge in
+  mode 6 to see the second half of that argument directly. They are also trivial
+  as instanced geometry.
 - **Roof ornaments** — no. Protruding, genuinely overhanging (a height field is
   single-valued), skylined where nothing hides the artifact, and usually
   sub-cell at distance.
@@ -382,17 +392,46 @@ bound and no inflated shell is needed. A flat wall cannot grow a silhouette
 because the rasterizer emits no fragments beyond its polygon edge — relief can
 only bite inward.
 
+Three shapes, each with a closed-form ray test and an analytic parameterisation:
+a plane, a cylinder, and a box whose surface is the level set
+`max(|x|,|y|,|z|) = 1` — the Chebyshev norm is to a box what `length()` is to a
+cylinder, which keeps `fieldAt` one line per shape.
+
+**The cube's charts are oriented to wrap.** Each face spans exactly `uTile`
+repeats — an integer — so every edge lands on a tile boundary and no stone is cut
+through the middle at a corner. Better than that: the four side faces are
+oriented so `u` *continues* around them (leaving +Z at `u = t` re-enters +X at
+`u = 0`, which a tiling texture makes the same column) while `v` is world `y` on
+all four. So the pattern runs around all four vertical edges genuinely unbroken,
+not merely un-cut. Eight of the twelve edges join this way; the remaining four,
+where a side face's `u` axis meets a cap's `v` axis, cannot — no orientation of
+six charts on a cube is globally consistent, for the same reason you cannot comb
+a sphere. Those four are on the top and bottom, outside the default pitch range.
+
 **The screen grid is drawn from `gl_VertexID` alone**, with no vertex buffer: six
 vertices per cell, positions fetched from the G-buffer. Two details are load
 bearing. All four nodes of a cell are fetched by every one of its six vertices,
 because per-vertex validity is not enough — a triangle with one corner on the
 background and two on the hull still rasterizes, and interpolating a "skip me"
 flag across it leaves most of its pixels looking valid. Deciding per cell lets
-all six vertices agree and collapse to the same clipped position. The same test
-also rejects cells straddling the cylinder's `atan` seam, which would otherwise
-smear a full texture repeat across one cell. Culling is disabled for the pass:
-displacement flips triangle winding wherever the height field is steep, which is
-exactly where the interesting pixels are.
+all six vertices agree and collapse to the same clipped position. Culling is
+disabled for the pass: displacement flips triangle winding wherever the height
+field is steep, which is exactly where the interesting pixels are.
+
+**Wrapping charts have to be unwrapped before interpolation, not rejected.**
+Mode 6 is the only mode that interpolates UV across a primitive — every other one
+computes it per pixel from that pixel's own position, so a chart boundary only
+ever reaches their derivative clamp. The grid does not have that luxury: the
+cylinder's `atan` seam and each of the cube's four vertical edges jump a full
+repeat between neighbouring nodes, even though a tiling texture makes both sides
+of those joins the same texels. Interpolating the raw numbers sweeps the entire
+texture across one cell. Re-expressing every node on the first node's branch
+(`uv -= t * round((uv - ref) / t)`) is exact, costs one `round`, and is what
+makes the cube's corners continuous instead of gapped. Dropping those cells
+instead — the first thing tried — leaves a hairline of background down every
+corner and down the cylinder's seam, which is worse than the artifact it avoids.
+A range test still runs afterwards, to catch the four cube edges that are
+genuinely discontinuous and cannot be unwrapped.
 
 **The G-buffer needs a float-renderable target.** `RGBA32F` if
 `EXT_color_buffer_float` is present, `RGBA16F` if only the half-float variant is
